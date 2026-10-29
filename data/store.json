@@ -1,0 +1,17 @@
+{
+  "name": "Le-Gacy's Importation",
+  "whatsapp": "233266901277",
+  "whatsappDisplay": "0266901277",
+  "instagram": "legacys_trendy_collection",
+  "tiktokName": "Le-Gacy's Trendy Collection",
+  "momoNumber": "0599705322",
+  "categories": [
+    { "id": "phone-accessories", "name": "Phone accessories", "icon": "phone" },
+    { "id": "kitchen-home", "name": "Kitchen, storage & cleaning", "icon": "kitchen" },
+    { "id": "jewelry-watches", "name": "Jewelry & watches", "icon": "gem" },
+    { "id": "shoes-bags", "name": "Shoes & bags", "icon": "bag" },
+    { "id": "home-textile", "name": "Home textile", "icon": "bed" },
+    { "id": "mens-sports", "name": "Men's, sports & outdoor", "icon": "sport" },
+    { "id": "womens-wear", "name": "Women's lingerie & clothes", "icon": "shirt" }
+  ]
+}

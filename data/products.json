@@ -1,0 +1,380 @@
+[
+  {
+    "id": "p3-dan",
+    "name": "P3 Dan",
+    "category": "jewelry-watches",
+    "price": 8,
+    "inStock": true,
+    "preOrder": true,
+    "image": "/uploads/410d5647269c319a28f54cd72459322965c2.png",
+    "description": "jjk",
+    "sizes": [
+      "M"
+    ],
+    "colors": [],
+    "stock": 89
+  },
+  {
+    "id": "pack",
+    "name": "pack",
+    "category": "phone-accessories",
+    "price": 29,
+    "inStock": true,
+    "preOrder": true,
+    "image": "/uploads/8a948026eb2b0bf1140aa2518449a5dad806.png",
+    "description": "the bes",
+    "sizes": [
+      "L"
+    ],
+    "colors": [
+      "White",
+      "black"
+    ],
+    "stock": 30
+  },
+  {
+    "id": "fast-charger-20w",
+    "name": "20W fast charger",
+    "category": "phone-accessories",
+    "price": 65,
+    "inStock": true,
+    "image": "",
+    "description": "Compact wall charger with a USB-C port for quick charging. Works with most modern phones.",
+    "colors": [
+      "Black",
+      "White",
+      "Blue"
+    ]
+  },
+  {
+    "id": "braided-usb-c-cable",
+    "name": "Braided USB-C cable, 1 m",
+    "category": "phone-accessories",
+    "price": 25,
+    "inStock": true,
+    "image": "",
+    "description": "Tough braided cable for charging and data transfer. Does not tangle easily.",
+    "colors": [
+      "Black",
+      "White",
+      "Blue"
+    ]
+  },
+  {
+    "id": "wireless-earbuds",
+    "name": "Wireless earbuds",
+    "category": "phone-accessories",
+    "price": 120,
+    "inStock": true,
+    "image": "",
+    "description": "Bluetooth earbuds with a charging case and built-in microphone for calls.",
+    "colors": [
+      "Black",
+      "White",
+      "Blue"
+    ]
+  },
+  {
+    "id": "shockproof-phone-case",
+    "name": "Shockproof phone case",
+    "category": "phone-accessories",
+    "price": 35,
+    "inStock": true,
+    "image": "",
+    "description": "Slim protective case with raised edges to guard the screen and camera.",
+    "colors": [
+      "Black",
+      "White",
+      "Blue"
+    ]
+  },
+  {
+    "id": "storage-container-set",
+    "name": "Stackable storage containers, set of 6",
+    "category": "kitchen-home",
+    "price": 85,
+    "inStock": true,
+    "image": "",
+    "description": "Airtight lids and a stackable shape keep dry food fresh and your cupboard tidy."
+  },
+  {
+    "id": "nonstick-frying-pan",
+    "name": "Non-stick frying pan, 28 cm",
+    "category": "kitchen-home",
+    "price": 110,
+    "inStock": true,
+    "image": "",
+    "description": "Even heating and an easy-clean surface for everyday cooking."
+  },
+  {
+    "id": "microfiber-cloths",
+    "name": "Microfiber cleaning cloths, pack of 10",
+    "category": "kitchen-home",
+    "price": 30,
+    "inStock": true,
+    "image": "",
+    "description": "Soft, absorbent cloths for glass, counters and floors. Washable and reusable."
+  },
+  {
+    "id": "over-sink-dish-rack",
+    "name": "Over-sink dish rack",
+    "category": "kitchen-home",
+    "price": 95,
+    "inStock": true,
+    "image": "",
+    "description": "Saves counter space and lets plates and cups drain straight into the sink."
+  },
+  {
+    "id": "steel-bracelet",
+    "name": "Stainless steel bracelet",
+    "category": "jewelry-watches",
+    "price": 70,
+    "inStock": true,
+    "image": "",
+    "description": "Tarnish-resistant bracelet with an adjustable clasp."
+  },
+  {
+    "id": "minimal-quartz-watch",
+    "name": "Minimal quartz watch",
+    "category": "jewelry-watches",
+    "price": 150,
+    "inStock": true,
+    "image": "",
+    "description": "Clean dial and a comfortable strap that suits both work and weekends.",
+    "colors": [
+      "Black",
+      "Silver",
+      "Gold"
+    ]
+  },
+  {
+    "id": "layered-necklace",
+    "name": "Layered necklace",
+    "category": "jewelry-watches",
+    "price": 55,
+    "inStock": true,
+    "image": "",
+    "description": "Two fine chains in one piece for an easy layered look."
+  },
+  {
+    "id": "pearl-stud-earrings",
+    "name": "Pearl stud earrings",
+    "category": "jewelry-watches",
+    "price": 40,
+    "inStock": true,
+    "image": "",
+    "description": "Simple pearl studs that go with almost any outfit."
+  },
+  {
+    "id": "mens-leather-sneakers",
+    "name": "Men's leather sneakers",
+    "category": "shoes-bags",
+    "price": 220,
+    "inStock": true,
+    "image": "",
+    "description": "Cushioned sole and a clean low-top design for daily wear.",
+    "sizes": [
+      "40",
+      "41",
+      "42",
+      "43",
+      "44",
+      "45"
+    ],
+    "colors": [
+      "Black",
+      "White",
+      "Brown"
+    ]
+  },
+  {
+    "id": "block-heel-sandals",
+    "name": "Women's block heel sandals",
+    "category": "shoes-bags",
+    "price": 140,
+    "inStock": false,
+    "preOrder": true,
+    "image": "",
+    "description": "Stable mid-height heel with an ankle strap. Easy to walk in.",
+    "sizes": [
+      "37",
+      "38",
+      "39",
+      "40",
+      "41",
+      "42"
+    ],
+    "colors": [
+      "Black",
+      "Nude",
+      "Red"
+    ]
+  },
+  {
+    "id": "crossbody-bag",
+    "name": "Crossbody bag",
+    "category": "shoes-bags",
+    "price": 130,
+    "inStock": true,
+    "image": "",
+    "description": "Compact bag with an adjustable strap and zip pocket for your essentials.",
+    "colors": [
+      "Black",
+      "Brown",
+      "Beige"
+    ]
+  },
+  {
+    "id": "travel-backpack",
+    "name": "Travel backpack",
+    "category": "shoes-bags",
+    "price": 180,
+    "inStock": true,
+    "image": "",
+    "description": "Roomy water-resistant backpack with a padded laptop sleeve.",
+    "colors": [
+      "Black",
+      "Navy",
+      "Grey"
+    ]
+  },
+  {
+    "id": "cotton-bedsheet-set",
+    "name": "Cotton bedsheet set",
+    "category": "home-textile",
+    "price": 250,
+    "inStock": true,
+    "image": "",
+    "description": "Soft cotton fitted sheet, flat sheet and two pillowcases.",
+    "colors": [
+      "White",
+      "Grey",
+      "Beige"
+    ]
+  },
+  {
+    "id": "bath-towel-set",
+    "name": "Fluffy bath towel set",
+    "category": "home-textile",
+    "price": 140,
+    "inStock": true,
+    "image": "",
+    "description": "Thick, quick-drying towels that stay soft after washing.",
+    "colors": [
+      "White",
+      "Blue",
+      "Grey"
+    ]
+  },
+  {
+    "id": "pillow-covers",
+    "name": "Throw pillow covers, set of 4",
+    "category": "home-textile",
+    "price": 60,
+    "inStock": true,
+    "image": "",
+    "description": "Refresh your sofa with zip-closure covers that are easy to remove and wash.",
+    "colors": [
+      "Beige",
+      "Sage",
+      "Terracotta"
+    ]
+  },
+  {
+    "id": "blackout-curtains",
+    "name": "Blackout curtains, pair",
+    "category": "home-textile",
+    "price": 180,
+    "inStock": true,
+    "image": "",
+    "description": "Thick fabric that blocks light and keeps rooms cooler.",
+    "colors": [
+      "White",
+      "Grey",
+      "Navy"
+    ]
+  },
+  {
+    "id": "quick-dry-tshirt",
+    "name": "Quick-dry sport T-shirt",
+    "category": "mens-sports",
+    "price": 55,
+    "inStock": true,
+    "image": "",
+    "description": "Breathable fabric that wicks sweat during workouts and runs."
+  },
+  {
+    "id": "jogging-trousers",
+    "name": "Jogging trousers",
+    "category": "mens-sports",
+    "price": 95,
+    "inStock": true,
+    "image": "",
+    "description": "Tapered fit with an elastic waist and zip pockets."
+  },
+  {
+    "id": "sports-water-bottle",
+    "name": "Sports water bottle, 1 L",
+    "category": "mens-sports",
+    "price": 40,
+    "inStock": true,
+    "image": "",
+    "description": "Leak-proof lid and a grippy body that fits most bag pockets."
+  },
+  {
+    "id": "led-torch",
+    "name": "Rechargeable LED torch",
+    "category": "mens-sports",
+    "price": 50,
+    "inStock": true,
+    "image": "",
+    "description": "Bright, rechargeable torch for camping, power cuts and night walks."
+  },
+  {
+    "id": "lace-lingerie-set",
+    "name": "Lace lingerie set",
+    "category": "womens-wear",
+    "price": 85,
+    "inStock": true,
+    "image": "",
+    "description": "Soft lace bra and brief set with a comfortable fit."
+  },
+  {
+    "id": "maxi-dress",
+    "name": "Maxi dress",
+    "category": "womens-wear",
+    "price": 140,
+    "inStock": true,
+    "image": "",
+    "description": "Flowing, lightweight dress for events and everyday wear.",
+    "sizes": [
+      "S",
+      "M",
+      "L",
+      "XL"
+    ],
+    "colors": [
+      "Red",
+      "Blue",
+      "Green"
+    ]
+  },
+  {
+    "id": "ribbed-bodysuit",
+    "name": "Ribbed bodysuit",
+    "category": "womens-wear",
+    "price": 70,
+    "inStock": true,
+    "image": "",
+    "description": "Stretchy ribbed fabric that sits smoothly under jeans and skirts."
+  },
+  {
+    "id": "seamless-bralette",
+    "name": "Seamless bralette",
+    "category": "womens-wear",
+    "price": 45,
+    "inStock": true,
+    "image": "",
+    "description": "Wire-free comfort with no visible lines under clothes."
+  }
+]
