@@ -53,13 +53,35 @@ async function saveOrderRow(client, order) {
   );
 }
 
-async function saveAnalyticsRows(client, days) {
-  await client.query('DELETE FROM analytics_days');
+const PRODUCT_WRITE_LOCK = 746851204092;
+const ANALYTICS_WRITE_LOCK = 746851204093;
+
+async function loadAnalyticsRows(client) {
+  const result = await client.query('SELECT date, views, visitors FROM analytics_days ORDER BY date');
+  return result.rows.map((row) => ({
+    date: row.date.toISOString ? row.date.toISOString().slice(0, 10) : String(row.date).slice(0, 10),
+    views: row.views,
+    visitors: row.visitors
+  }));
+}
+
+async function writeAnalyticsRows(client, days) {
   for (const day of days) {
     await client.query(
       `INSERT INTO analytics_days (date, views, visitors)
        VALUES ($1, $2, $3)
        ON CONFLICT (date) DO UPDATE SET views = EXCLUDED.views, visitors = EXCLUDED.visitors`,
+      [day.date, day.views, JSON.stringify(day.visitors)]
+    );
+  }
+}
+
+async function seedAnalyticsRows(client, days) {
+  for (const day of days) {
+    await client.query(
+      `INSERT INTO analytics_days (date, views, visitors)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (date) DO NOTHING`,
       [day.date, day.views, JSON.stringify(day.visitors)]
     );
   }
@@ -119,7 +141,7 @@ async function initialize(seed) {
       }
 
       const analyticsCount = await client.query('SELECT count(*)::integer AS count FROM analytics_days');
-      if (analyticsCount.rows[0].count === 0) await saveAnalyticsRows(client, seed.analytics.days);
+      if (analyticsCount.rows[0].count === 0) await seedAnalyticsRows(client, seed.analytics.days);
 
       await client.query('INSERT INTO app_migrations (name) VALUES ($1)', ['legacy_json_import_v1']);
     }
@@ -192,23 +214,68 @@ async function pruneAuthState() {
   await pool.query('DELETE FROM rate_limits WHERE reset_at <= now()');
 }
 
-async function saveOrder(order) {
-  await saveOrderRow(pool, order);
-}
-
-async function saveProducts(products) {
+async function saveOrder(order, expectedUpdatedAt) {
   await transaction(async (client) => {
-    if (products.length) {
-      await client.query('DELETE FROM products WHERE NOT (id = ANY($1::text[]))', [products.map((product) => product.id)]);
-    } else {
-      await client.query('DELETE FROM products');
+    if (expectedUpdatedAt === undefined) {
+      const result = await client.query(
+        `INSERT INTO orders (reference, customer_phone, status, created_at, data)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (reference) DO NOTHING
+         RETURNING reference`,
+        [order.ref, order.customer.phone, order.status, order.createdAt, order]
+      );
+      if (result.rowCount === 0) {
+        throw Object.assign(new Error('The order reference already exists.'), { status: 409 });
+      }
+      return;
     }
-    await saveProductRows(client, products);
+
+    const result = await client.query(
+      `UPDATE orders
+       SET customer_phone = $2, status = $3, created_at = $4, data = $5
+       WHERE reference = $1
+         AND COALESCE(data->>'updatedAt', data->>'createdAt') = $6
+       RETURNING reference`,
+      [order.ref, order.customer.phone, order.status, order.createdAt, order, expectedUpdatedAt]
+    );
+    if (result.rowCount === 0) {
+      throw Object.assign(new Error('The order changed during this request.'), { status: 409 });
+    }
   });
 }
 
-async function saveAnalytics(days) {
-  await transaction((client) => saveAnalyticsRows(client, days));
+async function updateProducts(update) {
+  if (typeof update !== 'function') throw new TypeError('Product updates must be a function.');
+  return transaction(async (client) => {
+    await client.query('SELECT pg_advisory_xact_lock($1)', [PRODUCT_WRITE_LOCK]);
+    const result = await client.query('SELECT data FROM products ORDER BY position, id');
+    const currentProducts = result.rows.map((row) => row.data);
+    const nextProducts = await update(currentProducts);
+    if (!Array.isArray(nextProducts)) throw new TypeError('Product updates must return a product list.');
+    if (nextProducts !== currentProducts) {
+      await client.query('DELETE FROM products');
+      await saveProductRows(client, nextProducts);
+    }
+    return nextProducts;
+  });
+}
+
+async function updateAnalytics(update) {
+  if (typeof update !== 'function') throw new TypeError('Analytics updates must be a function.');
+  return transaction(async (client) => {
+    await client.query('SELECT pg_advisory_xact_lock($1)', [ANALYTICS_WRITE_LOCK]);
+    const currentDays = await loadAnalyticsRows(client);
+    const nextDays = await update(currentDays);
+    if (!Array.isArray(nextDays)) throw new TypeError('Analytics updates must return an analytics list.');
+    const retainedDates = nextDays.map((day) => day.date);
+    if (retainedDates.length) {
+      await client.query('DELETE FROM analytics_days WHERE NOT (date = ANY($1::date[]))', [retainedDates]);
+    } else {
+      await client.query('DELETE FROM analytics_days');
+    }
+    await writeAnalyticsRows(client, nextDays);
+    return nextDays;
+  });
 }
 
 async function healthCheck() {
@@ -229,8 +296,8 @@ module.exports = {
   clearRateLimit,
   pruneAuthState,
   saveOrder,
-  saveProducts,
-  saveAnalytics,
+  updateProducts,
+  updateAnalytics,
   healthCheck,
   close
 };

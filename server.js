@@ -170,17 +170,21 @@ async function recordStoreVisit(visitorId) {
   const cutoff = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - ANALYTICS_RETENTION_DAYS + 1))
     .toISOString().slice(0, 10);
   const visitorHash = crypto.createHash('sha256').update(visitorId).digest('hex');
-  const days = storeAnalytics.days.filter((day) => day.date >= cutoff)
-    .map((day) => ({ ...day, visitors: day.visitors.slice() }));
-  let day = days.find((entry) => entry.date === today);
-  if (!day) {
-    day = { date: today, views: 0, visitors: [] };
-    days.push(day);
-  }
-  day.views += 1;
-  if (!day.visitors.includes(visitorHash)) day.visitors.push(visitorHash);
-  if (database) await database.saveAnalytics(days);
-  storeAnalytics.days = days;
+  const addVisit = (currentDays) => {
+    const days = currentDays.filter((day) => day.date >= cutoff)
+      .map((day) => ({ ...day, visitors: day.visitors.slice() }));
+    let day = days.find((entry) => entry.date === today);
+    if (!day) {
+      day = { date: today, views: 0, visitors: [] };
+      days.push(day);
+    }
+    day.views += 1;
+    if (!day.visitors.includes(visitorHash)) day.visitors.push(visitorHash);
+    return days;
+  };
+  storeAnalytics.days = database
+    ? await database.updateAnalytics(addVisit)
+    : addVisit(storeAnalytics.days);
   if (!database) persistStoreAnalytics();
 }
 
@@ -259,7 +263,10 @@ async function persist(order, updatedOrder) {
   const write = orderWriteQueue.then(async () => {
     const storedIndex = orders.findIndex((entry) => entry.ref === order.ref);
     if (database) {
-      await database.saveOrder(savedOrder);
+      const expectedUpdatedAt = updatedOrder
+        ? order.updatedAt || order.createdAt
+        : undefined;
+      await database.saveOrder(savedOrder, expectedUpdatedAt);
     } else {
       const nextOrders = orders.slice();
       if (storedIndex < 0) nextOrders.push(savedOrder);
@@ -276,10 +283,13 @@ async function persist(order, updatedOrder) {
 }
 
 let productWriteQueue = Promise.resolve();
-async function persistProducts(nextProducts = products) {
+async function persistProducts(updateProducts) {
   const write = productWriteQueue.then(async () => {
-    if (database) await database.saveProducts(nextProducts);
-    else await writeJsonAtomically(PRODUCTS_FILE, nextProducts);
+    const nextProducts = database
+      ? await database.updateProducts(updateProducts)
+      : updateProducts(products);
+    if (!Array.isArray(nextProducts)) throw new TypeError('Product updates must return a product list.');
+    if (!database) await writeJsonAtomically(PRODUCTS_FILE, nextProducts);
     products = nextProducts;
     productById = new Map(products.map((product) => [product.id, product]));
   });
@@ -1087,8 +1097,16 @@ async function handleApi(req, res, pathname) {
         if (!result.valid) return json(res, 400, { error: 'Fix the spreadsheet errors before importing.', rows: result.errors });
         const updates = new Map(result.imported.map(({ product }) => [product.id, product]));
         const additions = result.imported.filter(({ current }) => !current).map(({ product }) => product);
-        const nextProducts = products.map((product) => updates.get(product.id) || product);
-        await persistProducts([...additions, ...nextProducts]);
+        const updatedIds = new Set(result.imported.filter(({ current }) => current).map(({ product }) => product.id));
+        await persistProducts((currentProducts) => {
+          const currentIds = new Set(currentProducts.map((product) => product.id));
+          if (additions.some((product) => currentIds.has(product.id))
+            || [...updatedIds].some((id) => !currentIds.has(id))) {
+            throw Object.assign(new Error('The catalog changed while this spreadsheet was being imported. Review it and try again.'), { status: 409 });
+          }
+          const nextProducts = currentProducts.map((product) => updates.get(product.id) || product);
+          return [...additions, ...nextProducts];
+        });
         return json(res, 200, {
           added: result.added,
           updated: result.updated,
@@ -1119,36 +1137,47 @@ async function handleApi(req, res, pathname) {
         return fail(res, 400, 'Check the product name, category, price, stock quantity, and image URL.');
       }
       const existingId = clean(b.id, 80);
-      let id = existingId;
-      if (!id) {
-        id = name.toLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
-          .replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 70);
-        if (!id) id = 'product-' + crypto.randomBytes(4).toString('hex');
-        const base = id;
-        let suffix = 2;
-        while (productById.has(id)) id = base.slice(0, 70 - String(suffix).length) + '-' + suffix++;
-      }
-      const current = productById.get(id);
-      if (existingId && !current) return fail(res, 404, 'Product not found.');
-      const saved = {
-        id, name, category, price: Math.round(price * 100) / 100,
-        inStock: b.inStock === true, preOrder: b.preOrder === true,
-        image, description, sizes, colors
-      };
-      if (stock !== null) saved.stock = stock;
-      else if (current && Number.isInteger(current.stock)) saved.stock = current.stock;
-      const nextProducts = current
-        ? products.map((product) => product.id === id ? saved : product)
-        : [saved, ...products];
-      await persistProducts(nextProducts);
-      return json(res, current ? 200 : 201, { product: saved });
+      const baseId = name.toLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
+        .replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 70)
+        || 'product-' + crypto.randomBytes(4).toString('hex');
+      let saved;
+      let created;
+      await persistProducts((currentProducts) => {
+        let id = existingId || baseId;
+        if (!existingId) {
+          let suffix = 2;
+          while (currentProducts.some((product) => product.id === id)) {
+            id = baseId.slice(0, 70 - String(suffix).length) + '-' + suffix++;
+          }
+        }
+        const current = currentProducts.find((product) => product.id === id);
+        if (existingId && !current) {
+          throw Object.assign(new Error('Product not found.'), { status: 404 });
+        }
+        saved = {
+          id, name, category, price: Math.round(price * 100) / 100,
+          inStock: b.inStock === true, preOrder: b.preOrder === true,
+          image, description, sizes, colors
+        };
+        if (stock !== null) saved.stock = stock;
+        else if (current && Number.isInteger(current.stock)) saved.stock = current.stock;
+        created = !current;
+        return current
+          ? currentProducts.map((product) => product.id === id ? saved : product)
+          : [saved, ...currentProducts];
+      });
+      return json(res, created ? 201 : 200, { product: saved });
     }
     if (method === 'POST' && pathname === '/api/admin/products/delete') {
       const b = await readJson(req);
       const id = clean(b.id, 80);
-      if (!productById.has(id)) return fail(res, 404, 'Product not found.');
-      const nextProducts = products.filter((product) => product.id !== id);
-      await persistProducts(nextProducts);
+      let deleted = false;
+      await persistProducts((currentProducts) => {
+        const nextProducts = currentProducts.filter((product) => product.id !== id);
+        deleted = nextProducts.length !== currentProducts.length;
+        return deleted ? nextProducts : currentProducts;
+      });
+      if (!deleted) return fail(res, 404, 'Product not found.');
       return json(res, 200, { success: true });
     }
     if (method === 'POST' && pathname === '/api/admin/upload') {
@@ -1217,7 +1246,12 @@ async function handleRequest(req, res) {
   } catch (err) {
     const status = err && err.status ? err.status : 500;
     if (status === 500) console.error('Unhandled error:', err && err.message);
-    const msg = status === 413 ? 'Request too large.' : status === 415 ? 'Unsupported content type.' : status === 400 ? 'Invalid request.' : 'Something went wrong. Please try again.';
+    const msg = status === 413 ? 'Request too large.'
+      : status === 415 ? 'Unsupported content type.'
+        : status === 400 ? 'Invalid request.'
+          : status === 404 ? 'Not found.'
+            : status === 409 ? 'The data changed while you were working. Refresh and try again.'
+              : 'Something went wrong. Please try again.';
     if (!res.headersSent) return fail(res, status, msg);
     res.end();
   }
