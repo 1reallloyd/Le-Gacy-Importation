@@ -1186,7 +1186,7 @@ async function startServer() {
   await prepareUploadsDirectory();
   if (database) {
     const saved = await database.initialize({
-      products,
+      products: IMPORT_LEGACY_DATA ? products : [],
       orders: IMPORT_LEGACY_DATA ? orders : [],
       analytics: IMPORT_LEGACY_DATA ? storeAnalytics : { days: [] }
     });
