@@ -65,6 +65,10 @@
   }
 
   const money = (n) => 'GH₵ ' + Number(n).toLocaleString('en-GH', { minimumFractionDigits: 0, maximumFractionDigits: 2 });
+  let carouselTimer = null;
+  let orderRefreshTimer = null;
+  let trackedOrderSnapshot = '';
+  let orderRefreshRunning = false;
 
   async function api(path, body) {
     const opts = body === undefined ? {} : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) };
@@ -74,6 +78,42 @@
     try { data = await res.json(); } catch { /* ignore */ }
     if (!res.ok) throw Object.assign(new Error((data && data.error) || 'Something went wrong. Please try again.'), { status: res.status, fields: data && data.fields });
     return data;
+  }
+
+  function getVisitorId() {
+    const key = 'lg_visitor_id';
+    const format = (bytes) => {
+      bytes[6] = (bytes[6] & 0x0f) | 0x40;
+      bytes[8] = (bytes[8] & 0x3f) | 0x80;
+      const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+      return hex.slice(0, 8) + '-' + hex.slice(8, 12) + '-' + hex.slice(12, 16) + '-' + hex.slice(16, 20) + '-' + hex.slice(20);
+    };
+    try {
+      const existing = localStorage.getItem(key);
+      if (existing && /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(existing)) return existing;
+    } catch { /* Continue with a temporary visitor ID when storage is unavailable. */ }
+    const bytes = new Uint8Array(16);
+    window.crypto.getRandomValues(bytes);
+    const id = format(bytes);
+    try { localStorage.setItem(key, id); } catch { /* The visitor count still works for this page session. */ }
+    return id;
+  }
+
+  function recordStorePageView() {
+    let visitorId;
+    try { visitorId = getVisitorId(); }
+    catch (error) {
+      console.warn('Store visit could not be recorded:', error.message);
+      return;
+    }
+    fetch('/api/store/visit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ visitorId }),
+      keepalive: true
+    }).then((response) => {
+      if (!response.ok) console.warn('Store visit was not recorded (HTTP ' + response.status + ').');
+    }).catch((error) => console.warn('Store visit could not be recorded:', error.message));
   }
 
   /* ------------------------------------------------------------------
@@ -159,7 +199,7 @@
   function media(p, cls = '') {
     const idx = state.catalog.products.indexOf(p);
     const wrap = h('div', { class: ('media t' + (idx % 4) + ' ' + cls).trim() });
-    if (p.image && /^(\/|https:\/\/res\.cloudinary\.com\/)/.test(p.image)) {
+    if (p.image && (/^\/(?:uploads|images)\//.test(p.image) || /^https:\/\//i.test(p.image))) {
       wrap.append(h('img', { src: p.image, alt: p.name, loading: 'lazy', width: 400, height: 400 }));
     } else {
       const c = category(p.category);
@@ -194,12 +234,18 @@
   }
 
   function searchForm(value = '') {
-    const input = h('input', { class: 'input', type: 'search', name: 'q', placeholder: 'Search products', 'aria-label': 'Search products', value, maxlength: '60', autocomplete: 'off' });
+    const input = h('input', { class: 'input', type: 'search', name: 'q', placeholder: 'Search by name, category, or detail', 'aria-label': 'Search by name, category, or detail', value, maxlength: '60', autocomplete: 'off' });
+    const clear = h('button', { class: 'search-clear', type: 'button', 'aria-label': 'Clear search', hidden: !value, onclick: () => {
+      input.value = '';
+      form.requestSubmit();
+      input.focus();
+    } }, icon('x', 15));
     const form = h('form', { class: 'search', role: 'search', onsubmit: (e) => {
       e.preventDefault();
       const q = input.value.trim().slice(0, 60);
       go('/shop' + (q ? '?q=' + encodeURIComponent(q) : ''));
-    } }, icon('search', 16), input);
+    } }, icon('search', 16), input, clear);
+    input.addEventListener('input', () => { clear.hidden = input.value.length === 0; });
     return form;
   }
 
@@ -247,7 +293,7 @@
       { category: 'phone-accessories', title: 'Everyday tech', caption: 'Useful upgrades for life on the go.', image: 'https://images.unsplash.com/photo-1512499617640-c74ae3a79d37?auto=format&fit=crop&w=1200&q=80', alt: 'Smartphone and accessories arranged on a desk' },
       { category: 'kitchen-home', title: 'A better kitchen', caption: 'Clever finds for cooking and keeping tidy.', image: 'https://images.unsplash.com/photo-1556911220-bff31c812dba?auto=format&fit=crop&w=1200&q=80', alt: 'Bright, modern kitchen' },
       { category: 'jewelry-watches', title: 'Little details', caption: 'Jewelry and watches to finish your look.', image: 'https://images.unsplash.com/photo-1611652022419-a9419f74343d?auto=format&fit=crop&w=1200&q=80', alt: 'Gold jewelry styled for display' },
-      { category: 'shoes-bags', title: 'Step out in style', caption: 'Shoes and bags for wherever you’re headed.', image: 'https://images.unsplash.com/photo-1542291026-7eec264c27ff?auto=format&fit=crop&w=1200&q=80', alt: 'Bright red sneaker' },
+      { category: 'mens-shoes', title: 'Step out in style', caption: 'Find the right pair for every occasion.', image: 'https://images.unsplash.com/photo-1542291026-7eec264c27ff?auto=format&fit=crop&w=1200&q=80', alt: 'Bright red sneaker' },
       { category: 'womens-wear', title: 'Style your way', caption: 'Fresh wardrobe picks for every day.', image: 'https://images.unsplash.com/photo-1529139574466-a303027c1d8b?auto=format&fit=crop&w=1200&q=80', alt: 'Fashion model wearing a contemporary outfit' }
     ];
     const showcaseTrack = h('div', { class: 'showcase-track', tabindex: '0', 'aria-label': 'Swipe or use the controls to browse collections' },
@@ -295,6 +341,17 @@
       h('button', { class: 'showcase-arrow showcase-next', type: 'button', 'aria-label': 'Next collection', onclick: () => goToSlide(Math.round(showcaseTrack.scrollLeft / showcaseTrack.clientWidth) + 1) }, icon('chevron', 20)),
       h('div', { class: 'showcase-dots', 'aria-label': 'Choose a collection' }, dots));
     showcase.style.setProperty('--i', 2);
+    let carouselFocused = false;
+    showcase.addEventListener('mouseenter', () => { showcase.dataset.hovered = 'true'; });
+    showcase.addEventListener('mouseleave', () => { delete showcase.dataset.hovered; });
+    showcase.addEventListener('focusin', () => { carouselFocused = true; });
+    showcase.addEventListener('focusout', (event) => {
+      if (!showcase.contains(event.relatedTarget)) carouselFocused = false;
+    });
+    carouselTimer = window.setInterval(() => {
+      if (document.hidden || showcase.dataset.hovered === 'true' || carouselFocused) return;
+      goToSlide(Math.round(showcaseTrack.scrollLeft / showcaseTrack.clientWidth) + 1);
+    }, 20000);
 
     const hero = h('section', { class: 'wrap hero' },
       h('div', { class: 'hero-copy' },
@@ -307,6 +364,26 @@
           h('li', {}, icon('truck', 15), 'Track your order'))),
       showcase);
     for (const el of hero.querySelectorAll('.hero-copy .rise')) el.style.setProperty('--i', 0);
+
+    const categoryImages = {
+      'phone-accessories': 'https://images.unsplash.com/photo-1512499617640-c74ae3a79d37?auto=format&fit=crop&w=900&q=80',
+      'kitchen-home': 'https://images.unsplash.com/photo-1556911220-bff31c812dba?auto=format&fit=crop&w=900&q=80',
+      'jewelry-watches': 'https://images.unsplash.com/photo-1611652022419-a9419f74343d?auto=format&fit=crop&w=900&q=80',
+      'mens-shoes': 'https://images.unsplash.com/photo-1542291026-7eec264c27ff?auto=format&fit=crop&w=900&q=80',
+      'womens-shoes': 'https://images.unsplash.com/photo-1543163521-1bf539c55dd2?auto=format&fit=crop&w=900&q=80',
+      'shoes-bags': 'https://images.unsplash.com/photo-1553062407-98eeb64c6a62?auto=format&fit=crop&w=900&q=80',
+      'home-textile': 'https://images.unsplash.com/photo-1631049307264-da0ec9d70304?auto=format&fit=crop&w=900&q=80',
+      'mens-sports': 'https://images.unsplash.com/photo-1534438327276-14e5300c3a48?auto=format&fit=crop&w=900&q=80',
+      'mens-wear': 'https://images.unsplash.com/photo-1516826957135-700dedea698c?auto=format&fit=crop&w=900&q=80',
+      'womens-wear': 'https://images.unsplash.com/photo-1529139574466-a303027c1d8b?auto=format&fit=crop&w=900&q=80'
+    };
+    const categorySection = h('section', { class: 'wrap section category-section' },
+      h('div', { class: 'section-head' },
+        h('div', {}, h('h2', { text: 'Shop by category' }), h('p', { class: 'muted small', text: 'Explore the collections and find something you love.' }))),
+      h('div', { class: 'category-grid' }, state.catalog.categories.map((item) =>
+        h('a', { class: 'category-tile', href: '#/shop?cat=' + encodeURIComponent(item.id), 'aria-label': 'Shop ' + item.name },
+          h('img', { src: categoryImages[item.id] || '', alt: item.name, loading: 'lazy', decoding: 'async', referrerpolicy: 'no-referrer' }),
+          h('span', { class: 'category-tile-copy' }, h('span', { class: 'category-tile-name', text: item.name }), h('span', { class: 'category-tile-link' }, 'Explore ', icon('chevron', 15)))))));
 
     const latest = h('section', { class: 'wrap section' },
       h('div', { class: 'section-head' }, h('h2', { text: 'Popular right now' }), h('a', { class: 'link', href: '#/shop', text: 'See all products' })),
@@ -328,7 +405,28 @@
         h('li', {}, h('h3', { text: 'Pick what you like' }), h('p', { text: 'Add items to your cart and enter your delivery details.' })),
         h('li', {}, h('h3', { text: 'Pay securely' }), h('p', { text: 'Pay by card or Mobile Money in the Paystack checkout popup.' })),
         h('li', {}, h('h3', { text: 'We confirm and deliver' }), h('p', { text: 'Your payment is verified automatically, then we arrange delivery.' }))));
-    return [hero, latest, preorder, how].filter(Boolean);
+    const faqItems = [
+      ['How do I place an order?', 'Browse the store, choose any available size or color, and add products to your cart. Enter your contact and delivery details at checkout, then follow the payment instructions.'],
+      ['How can I pay?', 'Pay securely by card or Mobile Money through the Paystack checkout. Your payment is verified before your order is updated. Never share your card PIN or Mobile Money PIN.'],
+      ['How much is delivery, and when will it arrive?', 'Delivery fees and estimated delivery dates depend on your location. After you order, we’ll contact you on WhatsApp to confirm the delivery method, fee, and timing.'],
+      ['How long do pre-orders take?', 'Pre-order items are expected to arrive in about 40–60 days. Prices exclude shipping; we’ll confirm delivery arrangements with you on WhatsApp.'],
+      ['How do I track my order?', 'Open Track order and enter your order number and the phone number you used when ordering. We’ll also contact you on WhatsApp about delivery arrangements.'],
+      ['What if my item is damaged, incorrect, or missing?', 'Contact us on WhatsApp with your order number and a short description of the issue. Photos can help us review your request. We’ll confirm the available next steps with you.'],
+      ['Can I cancel an order or request a refund?', 'Contact us as soon as possible. We’ll check the order’s status and review your request. Refund eligibility, method, and timing are confirmed individually; refunds are not automatic.'],
+      ['How do I ask about a product?', 'Message us on WhatsApp with the product name and any questions about its options or availability.']
+    ];
+    const faq = h('section', { class: 'wrap section faq-section', 'aria-labelledby': 'faq-title' },
+      h('div', { class: 'faq-heading' },
+        h('span', { class: 'faq-eyebrow', text: 'Need a hand?' }),
+        h('h2', { id: 'faq-title', text: 'Frequently asked questions' }),
+        h('p', { class: 'muted', text: 'Quick answers to help you shop with confidence.' })),
+      h('div', { class: 'faq-list' }, faqItems.map(([question, answer], i) =>
+        h('details', { class: 'faq-item' },
+          h('summary', {}, h('span', { class: 'faq-number', text: String(i + 1).padStart(2, '0') }), h('span', { class: 'faq-question', text: question })),
+          h('p', { class: 'faq-answer', text: answer })))),
+      h('p', { class: 'faq-contact' }, 'Still have a question? ',
+        h('a', { class: 'link', href: waLink('Hello, I have a question about your store.'), target: '_blank', rel: 'noopener noreferrer', text: 'Chat with us on WhatsApp' })));
+    return [hero, categorySection, latest, preorder, how, faq].filter(Boolean);
   }
 
   function viewShop(params) {
@@ -338,10 +436,26 @@
     const availability = ['available', 'preorder'].includes(params.get('availability')) ? params.get('availability') : 'all';
     const sort = ['low', 'high'].includes(params.get('sort')) ? params.get('sort') : 'new';
 
-    let list = products.filter((p) =>
+    const queryTerms = normalizeSearchText(q).split(' ').filter(Boolean);
+    const filteredProducts = products.filter((p) =>
       (!cat || p.category === cat) &&
-      (!q || (p.name + ' ' + p.description).toLowerCase().includes(q.toLowerCase())) &&
       (availability === 'available' ? p.inStock : availability === 'preorder' ? isPreorder(p) : true));
+    let list = filteredProducts;
+    if (queryTerms.length) {
+      const matches = filteredProducts.map((p) => {
+        const text = productSearchText(p);
+        const matchedTerms = queryTerms.filter((term) => searchTermMatches(text, term)).length;
+        return { product: p, matchedTerms };
+      });
+      const exactMatches = matches.filter((match) => match.matchedTerms === queryTerms.length);
+      if (exactMatches.length) {
+        list = exactMatches.map((match) => match.product);
+      } else {
+        const bestMatchCount = Math.max(0, ...matches.map((match) => match.matchedTerms));
+        list = matches.filter((match) => match.matchedTerms === bestMatchCount && bestMatchCount > 0)
+          .map((match) => match.product);
+      }
+    }
     if (sort === 'low') list = list.slice().sort((a, b) => a.price - b.price);
     if (sort === 'high') list = list.slice().sort((a, b) => b.price - a.price);
 
@@ -366,7 +480,7 @@
       h('div', { class: 'chips' },
         h('a', { class: 'chip', href: '#' + build({ cat: '' }), 'aria-current': String(!cat), text: 'All' }),
         categories.map((c) => h('a', { class: 'chip', href: '#' + build({ cat: c.id }), 'aria-current': String(cat === c.id), text: c.name }))),
-      h('div', { class: 'availability-filters', 'aria-label': 'Filter by availability' },
+      h('div', { class: 'availability-filters', role: 'group', 'aria-label': 'Filter by availability' },
         [['all', 'All'], ['available', 'Available Now'], ['preorder', 'Pre-order']].map(([value, label]) =>
           h('a', { class: 'chip', href: '#' + build({ availability: value }), 'aria-current': String(availability === value), text: label }))));
 
@@ -376,10 +490,36 @@
         h('p', { class: 'muted small', text: list.length + (list.length === 1 ? ' item' : ' items') })),
       h('div', { class: 'toolbar' }, search, select),
       chips,
+      list.length && (cat || q || availability !== 'all' || sort !== 'new')
+        ? h('div', { class: 'filter-reset-row' }, h('a', { class: 'link', href: '#/shop', text: 'Clear search and filters' }))
+        : null,
       list.length
         ? h('div', { class: 'grid' }, list.map((p, i) => productCard(p, i)))
-        : h('div', { class: 'empty' }, h('h2', { text: availability === 'preorder' ? 'No pre-order items listed yet' : 'Nothing matched' }), h('p', { text: availability === 'preorder' ? 'Check back soon for items available to pre-order.' : 'Try a different word or browse all products.' }),
-          h('a', { class: 'btn', href: '#/shop', text: 'Clear filters' })));
+        : h('div', { class: 'empty' }, h('h2', { text: availability === 'preorder' && !queryTerms.length ? 'No pre-order items listed yet' : 'No products found' }), h('p', { text: queryTerms.length || cat || availability !== 'all' ? 'Try another search or clear your filters to see more products.' : 'Products will appear here when available.' }),
+          h('a', { class: 'btn', href: '#/shop', text: 'Clear search and filters' })));
+  }
+
+  function normalizeSearchText(value) {
+    return String(value || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/\s+/g, ' ').trim();
+  }
+
+  function searchTermMatches(text, term) {
+    if (text.includes(term)) return true;
+    if (term.length > 4 && term.endsWith('ies') && text.includes(term.slice(0, -3) + 'y')) return true;
+    return term.length > 4 && term.endsWith('s') && !term.endsWith('ss') && text.includes(term.slice(0, -1));
+  }
+
+  function productSearchText(product) {
+    const productCategory = category(product.category);
+    return normalizeSearchText([
+      product.id,
+      product.name,
+      product.description,
+      product.category,
+      productCategory ? productCategory.name : '',
+      ...(Array.isArray(product.sizes) ? product.sizes : []),
+      ...(Array.isArray(product.colors) ? product.colors : [])
+    ].join(' '));
   }
 
   function viewProduct(id) {
@@ -675,17 +815,19 @@
   ];
   const STATUS_TEXT = {
     awaiting_payment: ['Awaiting payment', 'warn'], payment_submitted: ['Checking payment', ''], confirmed: ['Confirmed', 'ok'],
-    processing: ['Processing', ''], dispatched: ['On the way', 'ok'], delivered: ['Delivered', 'ok'], cancelled: ['Cancelled', 'bad']
+    processing: ['Processing your order', ''], dispatched: ['On the way', 'ok'], delivered: ['Delivered', 'ok'], cancelled: ['Cancelled', 'bad']
   };
 
   async function viewOrder(ref) {
     let order;
     try { order = await loadOrder(ref); } catch (err) { return needLookup(ref); }
     if (!order) return needLookup(ref);
+    trackedOrderSnapshot = order.status + ':' + order.updatedAt;
     const [label, tone] = STATUS_TEXT[order.status] || ['Processing', ''];
     const idx = FLOW.findIndex((f) => f[0] === order.status);
     const paystackPaid = !!(order.payment && order.payment.provider === 'paystack');
     const justPaid = order.status === 'payment_submitted' || paystackPaid;
+    const updatedAt = new Date(order.updatedAt || order.createdAt);
 
     return h('div', { class: 'wrap page' },
       h('h1', { text: justPaid ? 'Thank you, ' + order.customerName.split(' ')[0] : 'Order ' + order.ref }),
@@ -703,7 +845,11 @@
             h('h2', {}, 'Status ', h('span', { class: 'status-pill ' + tone, text: label })),
             order.status === 'cancelled'
               ? h('p', { class: 'alert alert-err', text: 'This order was cancelled. Contact us on WhatsApp if you think this is a mistake.' })
-              : h('ol', { class: 'timeline' }, FLOW.map((f, i) => h('li', { class: i < idx ? 'done' : i === idx ? 'now' : '', text: f[1] }))),
+              : h('ol', { class: 'timeline', 'aria-label': 'Order delivery progress' }, FLOW.map((f, i) => h('li', { class: i < idx ? 'done' : i === idx ? 'now' : '', text: f[1] }))),
+            Number.isNaN(updatedAt.getTime()) ? null : h('p', {
+              class: 'small muted order-updated',
+              text: 'Last updated ' + updatedAt.toLocaleString('en-GH', { day: 'numeric', month: 'short', year: 'numeric', hour: 'numeric', minute: '2-digit' }) + '. This tracker refreshes automatically.'
+            }),
             order.status === 'awaiting_payment' && h('a', { class: 'btn btn-wide', href: '#/pay/' + encodeURIComponent(order.ref), text: 'Complete payment' }))),
         summary(order.items, order.subtotal)));
   }
@@ -810,10 +956,7 @@
       h('div', { class: 'wrap foot' },
         h('section', { class: 'foot-brand', 'aria-label': 'About Le-Gacy’s Importation' },
           h('a', { class: 'brand foot-logo', href: '#/', 'aria-label': "Le-Gacy's Importation, home" },
-            h('span', { class: 'brand-mark', 'aria-hidden': 'true', text: 'L' }),
-            h('span', { class: 'brand-name' },
-              h('span', { class: 'brand-primary', text: "Le-Gacy's" }),
-              h('span', { class: 'brand-secondary', text: 'Importation' }))),
+            h('img', { class: 'brand-logo', src: '/legacys-logo.svg', alt: '' })),
           h('p', { class: 'foot-motto', text: 'Quality imports for your home, style and everyday life.' })),
         h('section', { class: 'foot-contact', 'aria-labelledby': 'footer-contact-title' },
           h('h2', { id: 'footer-contact-title', text: 'We’re here to help' }),
@@ -896,6 +1039,7 @@
   ------------------------------------------------------------------ */
   let renderToken = 0;
   let lastPath = null;
+  let lastTrackedRoute = null;
 
   function go(path, replace) {
     const target = '#' + path;
@@ -904,9 +1048,21 @@
 
   async function route() {
     if (!state.catalog) return;
+    if (orderRefreshTimer !== null) {
+      window.clearInterval(orderRefreshTimer);
+      orderRefreshTimer = null;
+    }
+    if (carouselTimer !== null) {
+      window.clearInterval(carouselTimer);
+      carouselTimer = null;
+    }
     if (drawerOpen()) closeDrawer();
     const token = ++renderToken;
     const raw = location.hash.slice(1) || '/';
+    if (raw !== lastTrackedRoute) {
+      lastTrackedRoute = raw;
+      recordStorePageView();
+    }
     const [pathPart, query = ''] = raw.split('?');
     const params = new URLSearchParams(query);
     const seg = pathPart.split('/').filter(Boolean).map((s) => { try { return decodeURIComponent(s); } catch { return s; } });
@@ -938,6 +1094,29 @@
     });
     if (lastPath !== pathPart) { window.scrollTo(0, 0); main.focus({ preventScroll: true }); }
     lastPath = pathPart;
+    if (seg[0] === 'order') {
+      orderRefreshTimer = window.setInterval(() => refreshTrackedOrder(seg[1] || ''), 60000);
+    } else {
+      trackedOrderSnapshot = '';
+    }
+  }
+
+  async function refreshTrackedOrder(ref) {
+    if (!ref || orderRefreshRunning || document.hidden || !state.session || state.session.ref !== ref) return;
+    orderRefreshRunning = true;
+    try {
+      const order = await loadOrder(ref);
+      if (!order) return;
+      const snapshot = order.status + ':' + order.updatedAt;
+      if (snapshot !== trackedOrderSnapshot && location.hash === '#/order/' + encodeURIComponent(ref)) {
+        trackedOrderSnapshot = snapshot;
+        await route();
+      }
+    } catch (error) {
+      console.warn('Order tracking could not refresh:', error.message);
+    } finally {
+      orderRefreshRunning = false;
+    }
   }
 
   /* ------------------------------------------------------------------
@@ -952,6 +1131,16 @@
     $('#drawerClose').addEventListener('click', closeDrawer);
     $('#scrim').addEventListener('click', closeDrawer);
     document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && drawerOpen()) closeDrawer(); });
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) {
+        const [route, encodedRef] = location.hash.slice(1).split('/').filter(Boolean);
+        if (route === 'order' && encodedRef) {
+          let ref = encodedRef;
+          try { ref = decodeURIComponent(encodedRef); } catch { /* The route handler will show the lookup form. */ }
+          refreshTrackedOrder(ref);
+        }
+      }
+    });
     window.addEventListener('hashchange', route);
 
     state.cart = loadCart();

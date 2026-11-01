@@ -1,8 +1,8 @@
 'use strict';
 /**
  * Le-Gacy's Importation – store server.
- * Zero third-party dependencies: only Node built-ins, so there is nothing to
- * install and no package supply chain to keep patched.
+ * PostgreSQL uses the pg driver when DATABASE_URL is configured; JSON files
+ * remain available for local development without a database.
  *
  * Security model (summary – see README):
  *  - Prices, totals and availability are computed ONLY on the server.
@@ -17,6 +17,8 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { parse: parseCsv } = require('csv-parse/sync');
+const { readSheet } = require('read-excel-file/node');
 
 const ROOT = __dirname;
 const ENV_FILE = path.join(ROOT, '.env');
@@ -40,11 +42,23 @@ const PORT = Number(process.env.PORT) || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
 const TRUST_PROXY = process.env.TRUST_PROXY === '1'; // set when behind Nginx/Vercel/Render etc.
 const IS_PROD = process.env.NODE_ENV === 'production';
+const IMPORT_LEGACY_DATA = process.env.IMPORT_LEGACY_DATA === '1' || !IS_PROD;
+const DATABASE_URL = String(process.env.DATABASE_URL || '').trim();
+if (IS_PROD && !DATABASE_URL) {
+  throw new Error('Set DATABASE_URL to a PostgreSQL connection string before starting in production.');
+}
 const PAYSTACK_PUBLIC_KEY = process.env.PAYSTACK_PUBLIC_KEY || '';
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY || '';
+const PAYSTACK_TEST_MODE = process.env.PAYSTACK_TEST_MODE === '1';
 const PAYSTACK_CONFIGURED = /^pk_(test|live)_[A-Za-z0-9]+$/.test(PAYSTACK_PUBLIC_KEY)
   && /^sk_(test|live)_[A-Za-z0-9]+$/.test(PAYSTACK_SECRET_KEY)
   && PAYSTACK_PUBLIC_KEY.slice(3, 7) === PAYSTACK_SECRET_KEY.slice(3, 7);
+if (PAYSTACK_TEST_MODE && (!PAYSTACK_CONFIGURED || !PAYSTACK_PUBLIC_KEY.startsWith('pk_test_'))) {
+  throw new Error('PAYSTACK_TEST_MODE=1 requires matching Paystack test keys.');
+}
+if (IS_PROD && (!PAYSTACK_CONFIGURED || (!PAYSTACK_PUBLIC_KEY.startsWith('pk_live_') && !PAYSTACK_TEST_MODE))) {
+  throw new Error('Production requires matching Paystack live public and secret keys.');
+}
 const ADMIN_EMAIL = String(process.env.ADMIN_EMAIL || '').trim().toLowerCase();
 const ADMIN_PASSWORD = String(process.env.ADMIN_PASSWORD || '');
 if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(ADMIN_EMAIL) || ADMIN_PASSWORD.length < 20 || ADMIN_PASSWORD.length > 256) {
@@ -53,56 +67,432 @@ if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(ADMIN_EMAIL) || ADMIN_PASSWORD.length < 2
 
 const PUBLIC = path.join(ROOT, 'public');
 const DATA = path.join(ROOT, 'data');
+const UPLOADS_DIR = path.resolve(process.env.UPLOADS_DIR || path.join(PUBLIC, 'uploads'));
 const ORDERS_FILE = path.join(DATA, 'orders.json');
 const PRODUCTS_FILE = path.join(DATA, 'products.json');
+const ANALYTICS_FILE = path.join(DATA, 'analytics.json');
+const ANALYTICS_RETENTION_DAYS = 90;
+const PRODUCT_IMPORT_MAX_BYTES = 5 * 1024 * 1024;
+const PRODUCT_IMPORT_MAX_ROWS = 500;
+const PRODUCT_IMPORT_COLUMNS = new Set([
+  'id', 'name', 'category', 'price', 'instock', 'preorder', 'stock', 'qty',
+  'description', 'sizes', 'colors', 'image'
+]);
 
 const store = JSON.parse(fs.readFileSync(path.join(DATA, 'store.json'), 'utf8'));
 let products = JSON.parse(fs.readFileSync(PRODUCTS_FILE, 'utf8'));
 let productById = new Map(products.map((p) => [p.id, p]));
+const database = DATABASE_URL ? require('./database') : null;
+
+async function prepareUploadsDirectory() {
+  await fs.promises.mkdir(UPLOADS_DIR, { recursive: true });
+  const legacyUploads = path.join(PUBLIC, 'uploads');
+  if (UPLOADS_DIR === path.resolve(legacyUploads)) return;
+
+  let entries;
+  try {
+    entries = await fs.promises.readdir(legacyUploads, { withFileTypes: true });
+  } catch (error) {
+    if (error.code === 'ENOENT') return;
+    throw error;
+  }
+  for (const entry of entries) {
+    if (!entry.isFile() || !/^[A-Za-z0-9._-]+$/.test(entry.name)) continue;
+    const source = path.join(legacyUploads, entry.name);
+    const destination = path.join(UPLOADS_DIR, entry.name);
+    try {
+      await fs.promises.copyFile(source, destination, fs.constants.COPYFILE_EXCL);
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+    }
+  }
+}
 
 const ADMIN_PASSWORD_SALT = crypto.randomBytes(16);
 const ADMIN_PASSWORD_HASH = crypto.scryptSync(ADMIN_PASSWORD, ADMIN_PASSWORD_SALT, 64);
 const ADMIN_SESSION_TTL = 8 * 60 * 60 * 1000;
 const adminSessions = new Map();
+const ADMIN_LOGIN_FAILURE_LIMIT = 4;
+const ADMIN_LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const adminLoginFailures = new Map();
 
 /* ------------------------------------------------------------------ */
-/* Orders storage (atomic writes, private file permissions)           */
+/* Orders storage (PostgreSQL or atomic JSON-file writes)              */
 /* ------------------------------------------------------------------ */
 let orders = [];
-try { orders = JSON.parse(fs.readFileSync(ORDERS_FILE, 'utf8')); } catch { orders = []; }
-
-let writing = false;
-let dirty = false;
-function persist() {
-  dirty = true;
-  if (writing) return;
-  writing = true;
-  (async () => {
-    while (dirty) {
-      dirty = false;
-      const tmp = ORDERS_FILE + '.tmp';
-      await fs.promises.writeFile(tmp, JSON.stringify(orders, null, 2), { mode: 0o600 });
-      await fs.promises.rename(tmp, ORDERS_FILE);
-    }
-    writing = false;
-  })().catch(() => { writing = false; console.error('Could not save orders'); });
+try {
+  orders = JSON.parse(fs.readFileSync(ORDERS_FILE, 'utf8'));
+} catch (error) {
+  if (error.code !== 'ENOENT') throw new Error('Could not load orders: ' + error.message);
 }
 
-let productsWriting = false;
-let productsDirty = false;
-function persistProducts() {
-  productsDirty = true;
-  if (productsWriting) return;
-  productsWriting = true;
+let storeAnalytics = { days: [] };
+try {
+  const savedAnalytics = JSON.parse(fs.readFileSync(ANALYTICS_FILE, 'utf8'));
+  if (savedAnalytics && Array.isArray(savedAnalytics.days)) {
+    storeAnalytics.days = savedAnalytics.days.filter((day) => day && /^\d{4}-\d{2}-\d{2}$/.test(day.date)
+      && Number.isInteger(day.views) && day.views >= 0 && Array.isArray(day.visitors))
+      .map((day) => ({
+        date: day.date,
+        views: day.views,
+        visitors: [...new Set(day.visitors.filter((visitor) => typeof visitor === 'string' && /^[a-f0-9]{64}$/.test(visitor)))]
+      }));
+  }
+} catch (error) {
+  if (error.code !== 'ENOENT') throw new Error('Could not load store analytics: ' + error.message);
+}
+
+let analyticsWriting = false;
+let analyticsDirty = false;
+function persistStoreAnalytics() {
+  analyticsDirty = true;
+  if (analyticsWriting) return;
+  analyticsWriting = true;
   (async () => {
-    while (productsDirty) {
-      productsDirty = false;
-      const tmp = PRODUCTS_FILE + '.tmp';
-      await fs.promises.writeFile(tmp, JSON.stringify(products, null, 2), { mode: 0o600 });
-      await fs.promises.rename(tmp, PRODUCTS_FILE);
+    while (analyticsDirty) {
+      analyticsDirty = false;
+      const tmp = ANALYTICS_FILE + '.tmp';
+      await fs.promises.writeFile(tmp, JSON.stringify(storeAnalytics), { mode: 0o600 });
+      await fs.promises.rename(tmp, ANALYTICS_FILE);
     }
-    productsWriting = false;
-  })().catch(() => { productsWriting = false; console.error('Could not save products'); });
+    analyticsWriting = false;
+  })().catch((error) => {
+    analyticsWriting = false;
+    console.error('Could not save store analytics:', error.message);
+  });
+}
+
+async function recordStoreVisit(visitorId) {
+  const now = new Date();
+  const today = now.toISOString().slice(0, 10);
+  const cutoff = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - ANALYTICS_RETENTION_DAYS + 1))
+    .toISOString().slice(0, 10);
+  const visitorHash = crypto.createHash('sha256').update(visitorId).digest('hex');
+  const days = storeAnalytics.days.filter((day) => day.date >= cutoff)
+    .map((day) => ({ ...day, visitors: day.visitors.slice() }));
+  let day = days.find((entry) => entry.date === today);
+  if (!day) {
+    day = { date: today, views: 0, visitors: [] };
+    days.push(day);
+  }
+  day.views += 1;
+  if (!day.visitors.includes(visitorHash)) day.visitors.push(visitorHash);
+  if (database) await database.saveAnalytics(days);
+  storeAnalytics.days = days;
+  if (!database) persistStoreAnalytics();
+}
+
+function storeAnalyticsSummary(days) {
+  const now = new Date();
+  const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - days + 1));
+  const startDate = start.toISOString().slice(0, 10);
+  const records = storeAnalytics.days.filter((day) => day.date >= startDate);
+  const visitors = new Set(records.flatMap((day) => day.visitors));
+  const dailyByDate = new Map(records.map((day) => [day.date, day]));
+  const paidOrders = orders.filter((order) => ['confirmed', 'processing', 'dispatched', 'delivered'].includes(order.status)
+    && Date.parse(order.createdAt) >= start.getTime());
+  const productsSold = new Map();
+  paidOrders.forEach((order) => {
+    (Array.isArray(order.items) ? order.items : []).forEach((item) => {
+      const id = typeof item.id === 'string' ? item.id : item.name;
+      const existing = productsSold.get(id) || {
+        id,
+        name: item.name || id,
+        category: (productById.get(id) || {}).category || '',
+        quantity: 0,
+        revenue: 0
+      };
+      const quantity = Number.isInteger(item.qty) && item.qty > 0 ? item.qty : 0;
+      existing.quantity += quantity;
+      existing.revenue += Number(item.price || 0) * quantity;
+      productsSold.set(id, existing);
+    });
+  });
+  const salesByDate = new Map();
+  paidOrders.forEach((order) => {
+    const date = new Date(order.createdAt).toISOString().slice(0, 10);
+    salesByDate.set(date, (salesByDate.get(date) || 0) + 1);
+  });
+  const daily = [];
+  for (let offset = 0; offset < days; offset += 1) {
+    const date = new Date(start);
+    date.setUTCDate(start.getUTCDate() + offset);
+    const key = date.toISOString().slice(0, 10);
+    const record = dailyByDate.get(key);
+    daily.push({
+      date: key,
+      pageViews: record ? record.views : 0,
+      visitors: record ? new Set(record.visitors).size : 0,
+      paidOrders: salesByDate.get(key) || 0
+    });
+  }
+  return {
+    days,
+    pageViews: records.reduce((sum, day) => sum + day.views, 0),
+    uniqueVisitors: visitors.size,
+    paidOrders: paidOrders.length,
+    itemsSold: [...productsSold.values()].reduce((sum, item) => sum + item.quantity, 0),
+    revenue: paidOrders.reduce((sum, order) => sum + Number(order.subtotal || 0), 0),
+    daily,
+    topProducts: [...productsSold.values()]
+      .sort((a, b) => b.quantity - a.quantity || b.revenue - a.revenue)
+      .slice(0, 10)
+  };
+}
+
+let orderWriteQueue = Promise.resolve();
+async function writeJsonAtomically(file, value) {
+  const tmp = file + '.' + crypto.randomBytes(8).toString('hex') + '.tmp';
+  try {
+    await fs.promises.writeFile(tmp, JSON.stringify(value, null, 2), { mode: 0o600, flag: 'wx' });
+    await fs.promises.rename(tmp, file);
+  } catch (error) {
+    await fs.promises.rm(tmp, { force: true }).catch(() => {});
+    throw error;
+  }
+}
+
+async function persist(order, updatedOrder) {
+  const savedOrder = updatedOrder || order;
+  const write = orderWriteQueue.then(async () => {
+    const storedIndex = orders.findIndex((entry) => entry.ref === order.ref);
+    if (database) {
+      await database.saveOrder(savedOrder);
+    } else {
+      const nextOrders = orders.slice();
+      if (storedIndex < 0) nextOrders.push(savedOrder);
+      else nextOrders[storedIndex] = savedOrder;
+      await writeJsonAtomically(ORDERS_FILE, nextOrders);
+      orders = nextOrders;
+    }
+    if (savedOrder !== order) Object.assign(order, savedOrder);
+    if (storedIndex < 0) orders.push(order);
+    else orders[storedIndex] = order;
+  });
+  orderWriteQueue = write.catch(() => {});
+  await write;
+}
+
+let productWriteQueue = Promise.resolve();
+async function persistProducts(nextProducts = products) {
+  const write = productWriteQueue.then(async () => {
+    if (database) await database.saveProducts(nextProducts);
+    else await writeJsonAtomically(PRODUCTS_FILE, nextProducts);
+    products = nextProducts;
+    productById = new Map(products.map((product) => [product.id, product]));
+  });
+  productWriteQueue = write.catch(() => {});
+  await write;
+}
+
+function validProductImage(image) {
+  if (!image || /^\/(?:uploads|images)\/[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*$/.test(image)) return true;
+  try {
+    const url = new URL(image);
+    return url.protocol === 'https:' && !!url.hostname && !url.username && !url.password;
+  } catch {
+    return false;
+  }
+}
+
+function importCellText(value) {
+  if (value === null || value === undefined) return '';
+  if (value instanceof Date) return value.toISOString();
+  return String(value).trim();
+}
+
+function parseImportBoolean(value, fallback, label, rowNumber, errors) {
+  const text = importCellText(value).toLowerCase();
+  if (!text) return fallback;
+  if (['true', 'yes', '1'].includes(text)) return true;
+  if (['false', 'no', '0'].includes(text)) return false;
+  errors.push({ row: rowNumber, message: label + ' must be true or false.' });
+  return fallback;
+}
+
+function importProductId(value, name, usedIds) {
+  const supplied = importCellText(value).toLowerCase();
+  if (supplied && !/^[a-z0-9][a-z0-9_-]{0,79}$/.test(supplied)) return null;
+  const baseId = supplied || name.toLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 70);
+  if (!baseId) return null;
+  let id = baseId;
+  let suffix = 2;
+  while (usedIds.has(id) || (!supplied && productById.has(id))) {
+    if (supplied) return null;
+    id = baseId.slice(0, 70 - String(suffix).length) + '-' + suffix++;
+  }
+  return id;
+}
+
+async function parseProductImport(body) {
+  const fileName = typeof body.fileName === 'string' ? body.fileName.trim() : '';
+  const extension = path.extname(fileName).toLowerCase();
+  const encoded = typeof body.data === 'string' ? body.data : '';
+  const maxEncodedLength = Math.ceil(PRODUCT_IMPORT_MAX_BYTES / 3) * 4;
+  if (!fileName || fileName.length > 200 || /[\u0000-\u001f]/.test(fileName)
+    || !['.xlsx', '.csv'].includes(extension)
+    || !encoded || encoded.length > maxEncodedLength
+    || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) {
+    throw Object.assign(new Error('Choose a valid .xlsx or .csv product file smaller than 5 MB.'), { status: 400 });
+  }
+
+  const workbook = Buffer.from(encoded, 'base64');
+  if (!workbook.length || workbook.length > PRODUCT_IMPORT_MAX_BYTES) {
+    throw Object.assign(new Error('The product file must be smaller than 5 MB.'), { status: 400 });
+  }
+
+  let rowEntries;
+  try {
+    if (extension === '.xlsx') {
+      if (workbook[0] !== 0x50 || workbook[1] !== 0x4b) throw new Error('not an XLSX archive');
+      const rows = await readSheet(workbook);
+      rowEntries = rows.map((row, index) => ({ row, rowNumber: index + 1 }));
+    } else {
+      const records = parseCsv(workbook.toString('utf8'), {
+        bom: true,
+        skip_empty_lines: true,
+        relax_column_count: false,
+        max_record_size: 100000,
+        info: true
+      });
+      let previousLine = 0;
+      let previousEmptyLines = 0;
+      rowEntries = records.map(({ record, info }) => {
+        const rowNumber = previousLine + info.empty_lines - previousEmptyLines + 1;
+        previousLine = info.lines;
+        previousEmptyLines = info.empty_lines;
+        return { row: record, rowNumber };
+      });
+    }
+  } catch {
+    throw Object.assign(new Error('The spreadsheet could not be read. Use a valid .xlsx or .csv file.'), { status: 400 });
+  }
+
+  if (!Array.isArray(rowEntries) || rowEntries.length < 2) {
+    return { valid: false, errors: [{ row: 1, message: 'Add a header row and at least one product.' }] };
+  }
+  const headers = rowEntries[0].row.map((value) => importCellText(value).toLowerCase());
+  const headerRowNumber = rowEntries[0].rowNumber;
+  const columnIndexes = new Map();
+  const errors = [];
+  headers.forEach((header, index) => {
+    if (!header) return;
+    if (!PRODUCT_IMPORT_COLUMNS.has(header)) {
+      errors.push({ row: headerRowNumber, message: 'Unknown column "' + header + '". Use the downloadable template headers.' });
+    } else {
+      const normalizedHeader = header === 'qty' ? 'stock' : header;
+      if (columnIndexes.has(normalizedHeader)) {
+        errors.push({ row: headerRowNumber, message: 'Use either "qty" or "stock" for inventory quantity, not both.' });
+      } else {
+        columnIndexes.set(normalizedHeader, index);
+      }
+    }
+  });
+  for (const required of ['name', 'category', 'price']) {
+    if (!columnIndexes.has(required)) errors.push({ row: headerRowNumber, message: 'Required column "' + required + '" is missing.' });
+  }
+  if (errors.length) return { valid: false, errors };
+
+  const dataRows = rowEntries.slice(1)
+    .filter(({ row }) => Array.isArray(row) && row.some((value) => importCellText(value) !== ''));
+  if (dataRows.length > PRODUCT_IMPORT_MAX_ROWS) {
+    return { valid: false, errors: [{ row: 1, message: 'The file exceeds the limit of ' + PRODUCT_IMPORT_MAX_ROWS + ' products.' }] };
+  }
+  const usedIds = new Set();
+  const imported = [];
+  const summaries = [];
+
+  dataRows.forEach(({ row, rowNumber }) => {
+    if (row.length > headers.length && row.slice(headers.length).some((value) => importCellText(value) !== '')) {
+      errors.push({ row: rowNumber, message: 'This row contains values beyond the header columns.' });
+      return;
+    }
+    const valueFor = (column) => columnIndexes.has(column) ? row[columnIndexes.get(column)] : undefined;
+    const name = clean(valueFor('name'), 100);
+    const categoryInput = importCellText(valueFor('category')).toLowerCase();
+    const category = store.categories.find((item) => item.id.toLowerCase() === categoryInput
+      || item.name.trim().toLowerCase() === categoryInput);
+    const priceText = importCellText(valueFor('price'));
+    const price = typeof valueFor('price') === 'number' ? valueFor('price') : Number(priceText);
+    let rowInvalid = false;
+    const addError = (message) => { errors.push({ row: rowNumber, message }); rowInvalid = true; };
+
+    if (name.length < 2) addError('Product name must contain at least 2 characters.');
+    if (!category) addError('Category must match a store category ID or name.');
+    if (!priceText) addError('Price is required.');
+    else if (!Number.isFinite(price)) addError('Price must be a valid number.');
+    else if (price < 0.01) addError('Price must be greater than 0.');
+    else if (price > 1000000) addError('Price must not exceed 1,000,000.');
+
+    const suppliedId = importCellText(valueFor('id'));
+    const id = importProductId(suppliedId, name, usedIds);
+    if (!id) addError(suppliedId ? 'Product ID is invalid or duplicated in this file.' : 'Product name cannot be converted into a unique product ID.');
+    else usedIds.add(id);
+
+    const current = id && productById.get(id);
+    const parseOptionalNumber = (column, fallback, wholeNumber, maximum) => {
+      if (!columnIndexes.has(column) || !importCellText(valueFor(column))) return fallback;
+      const rawValue = valueFor(column);
+      const text = importCellText(rawValue);
+      const parsed = typeof rawValue === 'number' ? rawValue : Number(text);
+      if (!Number.isFinite(parsed) || parsed < 0 || parsed > maximum || (wholeNumber && !Number.isInteger(parsed))) {
+        addError(column === 'stock'
+          ? 'Stock must be a whole number between 0 and 1,000,000.'
+          : 'Price must be a valid number.');
+        return fallback;
+      }
+      return parsed;
+    };
+    const inStock = columnIndexes.has('instock')
+      ? parseImportBoolean(valueFor('instock'), current ? current.inStock : true, 'inStock', rowNumber, errors)
+      : current ? current.inStock : true;
+    const preOrder = columnIndexes.has('preorder')
+      ? parseImportBoolean(valueFor('preorder'), current ? current.preOrder === true : false, 'preOrder', rowNumber, errors)
+      : current ? current.preOrder === true : false;
+    const stock = parseOptionalNumber('stock', current ? current.stock : undefined, true, 1000000);
+    const imageInput = columnIndexes.has('image') ? clean(valueFor('image'), 1000) : '';
+    const image = imageInput || (current ? current.image || '' : '');
+    if (!validProductImage(image)) addError('Image must be a /uploads or /images path, or a supported HTTPS Cloudinary URL.');
+
+    const parseList = (column) => {
+      if (!columnIndexes.has(column) || !importCellText(valueFor(column))) {
+        return current && Array.isArray(current[column]) ? current[column] : [];
+      }
+      return importCellText(valueFor(column)).split(',').map((item) => clean(item, column === 'sizes' ? 30 : 40))
+        .filter(Boolean).slice(0, 30);
+    };
+    const description = columnIndexes.has('description') && importCellText(valueFor('description'))
+      ? clean(valueFor('description'), 500)
+      : current ? current.description || '' : '';
+
+    if (rowInvalid) return;
+    const product = {
+      id,
+      name,
+      category: category.id,
+      price: Math.round(price * 100) / 100,
+      inStock,
+      preOrder,
+      image,
+      description,
+      sizes: parseList('sizes'),
+      colors: parseList('colors')
+    };
+    if (stock !== undefined) product.stock = stock;
+    imported.push({ product, current });
+    summaries.push({ row: rowNumber, id, name, action: current ? 'update' : 'add', price: product.price });
+  });
+
+  if (errors.length) return { valid: false, errors };
+  if (imported.length === 0) return { valid: false, errors: [{ row: 2, message: 'No product rows were found.' }] };
+  return {
+    valid: true,
+    imported,
+    summaries,
+    added: imported.filter((item) => !item.current).length,
+    updated: imported.filter((item) => item.current).length
+  };
 }
 
 /* ------------------------------------------------------------------ */
@@ -190,6 +580,7 @@ function publicOrder(o) {
     ref: o.ref,
     status: o.status,
     createdAt: o.createdAt,
+    updatedAt: o.updatedAt || o.createdAt,
     customerName: o.customer.name,
     customerEmail: o.customer.email || '',
     items: o.items,
@@ -218,9 +609,30 @@ function limited(req, name, max, windowMs) {
   b.count += 1;
   return b.count > max;
 }
+function adminLoginFailureCount(req) {
+  const key = clientIp(req);
+  const bucket = adminLoginFailures.get(key);
+  if (!bucket || bucket.reset <= Date.now()) {
+    adminLoginFailures.delete(key);
+    return 0;
+  }
+  return bucket.count;
+}
+function recordAdminLoginFailure(req) {
+  const key = clientIp(req);
+  const now = Date.now();
+  let bucket = adminLoginFailures.get(key);
+  if (!bucket || bucket.reset <= now) {
+    bucket = { count: 0, reset: now + ADMIN_LOGIN_WINDOW_MS };
+    adminLoginFailures.set(key, bucket);
+  }
+  bucket.count += 1;
+  return bucket;
+}
 setInterval(() => {
   const now = Date.now();
   for (const [k, b] of buckets) if (b.reset <= now) buckets.delete(k);
+  for (const [k, b] of adminLoginFailures) if (b.reset <= now) adminLoginFailures.delete(k);
 }, 60 * 1000).unref();
 
 /* ------------------------------------------------------------------ */
@@ -231,7 +643,7 @@ const SECURITY_HEADERS = {
     "default-src 'self'",
     "script-src 'self' https://js.paystack.co",
     "style-src 'self' 'unsafe-inline' https://paystack.com/public/css/",
-    "img-src 'self' data: https://res.cloudinary.com https://images.unsplash.com",
+    "img-src 'self' data: https:",
     "font-src 'self'",
     "connect-src 'self' https://api.paystack.co https://*.paystack.com",
     "frame-src https://checkout.paystack.com https://*.paystack.com",
@@ -289,7 +701,7 @@ function readJson(req, limit = 10 * 1024) {
 const MIME = {
   '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
   '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.ico': 'image/x-icon',
-  '.json': 'application/json', '.webmanifest': 'application/manifest+json', '.txt': 'text/plain; charset=utf-8'
+  '.csv': 'text/csv; charset=utf-8', '.json': 'application/json', '.webmanifest': 'application/manifest+json', '.txt': 'text/plain; charset=utf-8'
 };
 
 function serveStatic(req, res, pathname) {
@@ -297,8 +709,11 @@ function serveStatic(req, res, pathname) {
   try { rel = decodeURIComponent(pathname); } catch { return fail(res, 400, 'Bad request.'); }
   if (rel.includes('\0')) return fail(res, 400, 'Bad request.');
   if (rel === '/') rel = '/index.html';
-  const file = path.normalize(path.join(PUBLIC, rel));
-  if (file !== PUBLIC && !file.startsWith(PUBLIC + path.sep)) return fail(res, 403, 'Forbidden.');
+  const isUpload = rel.startsWith('/uploads/');
+  const root = isUpload ? UPLOADS_DIR : PUBLIC;
+  const relativePath = isUpload ? rel.slice('/uploads/'.length) : rel.replace(/^[/\\]/, '');
+  const file = path.resolve(root, relativePath);
+  if (file !== root && !file.startsWith(root + path.sep)) return fail(res, 403, 'Forbidden.');
   fs.stat(file, (err, st) => {
     if (err || !st.isFile()) {
       // Unknown path with an extension => 404; clean paths fall back to the app shell.
@@ -326,6 +741,18 @@ function serveStatic(req, res, pathname) {
 /* ------------------------------------------------------------------ */
 async function handleApi(req, res, pathname) {
   const method = req.method;
+
+  if (method === 'POST' && pathname === '/api/store/visit') {
+    if (!sameOrigin(req)) return fail(res, 403, 'Request rejected.');
+    if (limited(req, 'store-visit', 120, 15 * 60 * 1000)) return fail(res, 429, 'Too many visits recorded. Please try again later.');
+    const body = await readJson(req, 1024);
+    const visitorId = typeof body.visitorId === 'string' ? body.visitorId : '';
+    if (!/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(visitorId)) {
+      return fail(res, 400, 'A valid visitor ID is required.');
+    }
+    await recordStoreVisit(visitorId.toLowerCase());
+    return json(res, 202, { success: true });
+  }
 
   if (method === 'GET' && pathname === '/api/paystack/config') {
     return json(res, 200, {
@@ -412,13 +839,13 @@ async function handleApi(req, res, pathname) {
       ref: newRef(),
       status: 'awaiting_payment',
       createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
       customer: { name, email, phone, town, address, notes },
       items: lines,
       subtotal: pesewas / 100,
       payment: null
     };
-    orders.push(order);
-    persist();
+    await persist(order);
     return json(res, 201, { order: publicOrder(order) });
   }
 
@@ -434,9 +861,11 @@ async function handleApi(req, res, pathname) {
     if (order.status !== 'awaiting_payment') return fail(res, 409, 'This order is no longer awaiting payment.');
 
     const reference = 'LG' + crypto.randomBytes(16).toString('hex');
-    if (!Array.isArray(order.paystackReferences)) order.paystackReferences = [];
-    order.paystackReferences.push(reference);
-    persist();
+    const updatedOrder = {
+      ...order,
+      paystackReferences: [...(Array.isArray(order.paystackReferences) ? order.paystackReferences : []), reference]
+    };
+    await persist(order, updatedOrder);
     return json(res, 200, { reference });
   }
 
@@ -484,16 +913,19 @@ async function handleApi(req, res, pathname) {
       return fail(res, 409, 'Paystack has not confirmed the exact amount for this order yet.');
     }
 
-    order.payment = {
-      provider: 'paystack',
-      reference,
-      transactionId: payment.id,
-      channel: clean(payment.channel, 40),
-      amount: payment.amount / 100,
-      paidAt: payment.paid_at || new Date().toISOString()
-    };
-    order.status = 'confirmed';
-    persist();
+    await persist(order, {
+      ...order,
+      payment: {
+        provider: 'paystack',
+        reference,
+        transactionId: payment.id,
+        channel: clean(payment.channel, 40),
+        amount: payment.amount / 100,
+        paidAt: payment.paid_at || new Date().toISOString()
+      },
+      status: 'confirmed',
+      updatedAt: new Date().toISOString()
+    });
     return json(res, 200, { order: publicOrder(order) });
   }
 
@@ -528,35 +960,41 @@ async function handleApi(req, res, pathname) {
     if (orders.some((o) => o.payment && o.payment.txnId === txnId)) {
       return fail(res, 409, 'That transaction ID has already been used. If this is a mistake, contact us on WhatsApp.', { txnId: 'This ID was already submitted.' });
     }
-    order.payment = { txnId, payerName, submittedAt: new Date().toISOString(), amount: order.subtotal };
-    order.status = 'payment_submitted';
-    persist();
+    await persist(order, {
+      ...order,
+      payment: { txnId, payerName, submittedAt: new Date().toISOString(), amount: order.subtotal },
+      status: 'payment_submitted',
+      updatedAt: new Date().toISOString()
+    });
     return json(res, 200, { order: publicOrder(order) });
   }
 
   /* ---- admin ---- */
   if (pathname.startsWith('/api/admin/')) {
-    if (limited(req, 'admin', 60, 15 * 60 * 1000)) return fail(res, 429, 'Too many requests.');
+    if (limited(req, 'admin', 300, 15 * 60 * 1000)) return fail(res, 429, 'Too many requests.');
     if (method === 'POST' && !sameOrigin(req)) return fail(res, 403, 'Request rejected.');
     if (method === 'POST' && pathname === '/api/admin/login') {
-      if (limited(req, 'admin-login-ip', 20, 15 * 60 * 1000)) return fail(res, 429, 'Too many sign-in attempts. Try again later.');
+      if (adminLoginFailureCount(req) >= ADMIN_LOGIN_FAILURE_LIMIT) {
+        return fail(res, 429, 'Too many incorrect sign-in attempts. Please wait 15 minutes before trying again.');
+      }
       const b = await readJson(req);
       const email = typeof b.email === 'string' ? b.email.trim().toLowerCase().slice(0, 254) : '';
       const password = typeof b.password === 'string' && b.password.length <= 256 ? b.password : '';
-      const emailKey = crypto.createHash('sha256').update(email).digest('hex').slice(0, 24);
-      if (limited(req, 'admin-login-email-' + emailKey, 8, 15 * 60 * 1000)) {
-        return fail(res, 429, 'Too many sign-in attempts. Try again later.');
-      }
+      recordAdminLoginFailure(req);
       const passwordHash = await new Promise((resolve, reject) => {
         crypto.scrypt(password, ADMIN_PASSWORD_SALT, 64, (error, derived) => error ? reject(error) : resolve(derived));
       });
       const credentialsMatch = Number(safeEqual(email, ADMIN_EMAIL)) & Number(crypto.timingSafeEqual(passwordHash, ADMIN_PASSWORD_HASH));
-      if (!credentialsMatch) return fail(res, 401, 'Email or password is incorrect.');
+      if (!credentialsMatch) {
+        if (adminLoginFailureCount(req) >= ADMIN_LOGIN_FAILURE_LIMIT) {
+          return fail(res, 429, 'Too many incorrect sign-in attempts. Please wait 15 minutes before trying again.');
+        }
+        return fail(res, 401, 'Email or password is incorrect.');
+      }
 
       const id = crypto.randomBytes(32).toString('hex');
       adminSessions.set(id, { expiresAt: Date.now() + ADMIN_SESSION_TTL });
-      buckets.delete('admin-login-ip|' + clientIp(req));
-      buckets.delete('admin-login-email-' + emailKey + '|' + clientIp(req));
+      adminLoginFailures.delete(clientIp(req));
       return json(res, 200, { email: ADMIN_EMAIL }, { 'Set-Cookie': adminCookie(id, ADMIN_SESSION_TTL / 1000) });
     }
     if (method === 'GET' && pathname === '/api/admin/session') {
@@ -574,6 +1012,11 @@ async function handleApi(req, res, pathname) {
     if (method === 'GET' && pathname === '/api/admin/dashboard') {
       return json(res, 200, { orders: orders.slice().reverse(), products, categories: store.categories, store: { name: store.name } });
     }
+    if (method === 'GET' && pathname === '/api/admin/analytics') {
+      const requestedDays = Number(new URL(req.url, 'http://x').searchParams.get('days'));
+      const days = [7, 30, 90].includes(requestedDays) ? requestedDays : 30;
+      return json(res, 200, storeAnalyticsSummary(days));
+    }
     if (method === 'GET' && pathname === '/api/admin/orders') {
       return json(res, 200, { orders: orders.slice().reverse() });
     }
@@ -583,9 +1026,50 @@ async function handleApi(req, res, pathname) {
       const status = String(b.status || '');
       const order = orders.find((o) => o.ref === ref);
       if (!order || !STATUSES.includes(status)) return fail(res, 400, 'Invalid order or status.');
-      order.status = status;
-      persist();
+      const updatedOrder = order.status === status ? order : {
+        ...order,
+        status,
+        updatedAt: new Date().toISOString()
+      };
+      await persist(order, updatedOrder);
       return json(res, 200, { order });
+    }
+    if (method === 'POST' && pathname === '/api/admin/products/import/preview') {
+      try {
+        const body = await readJson(req, 7 * 1024 * 1024);
+        const result = await parseProductImport(body);
+        return json(res, 200, result.valid
+          ? { valid: true, added: result.added, updated: result.updated, products: result.summaries }
+          : { valid: false, errors: result.errors });
+      } catch (error) {
+        if (!error.status) console.error('Product import preview failed:', error.message);
+        const status = error.status || 500;
+        return fail(res, status, status === 413
+          ? 'The spreadsheet request is too large.'
+          : status === 400 ? error.message : 'The spreadsheet could not be previewed. Please try again.');
+      }
+    }
+    if (method === 'POST' && pathname === '/api/admin/products/import') {
+      try {
+        const body = await readJson(req, 7 * 1024 * 1024);
+        const result = await parseProductImport(body);
+        if (!result.valid) return json(res, 400, { error: 'Fix the spreadsheet errors before importing.', rows: result.errors });
+        const updates = new Map(result.imported.map(({ product }) => [product.id, product]));
+        const additions = result.imported.filter(({ current }) => !current).map(({ product }) => product);
+        const nextProducts = products.map((product) => updates.get(product.id) || product);
+        await persistProducts([...additions, ...nextProducts]);
+        return json(res, 200, {
+          added: result.added,
+          updated: result.updated,
+          products: result.imported.map(({ product }) => product)
+        });
+      } catch (error) {
+        if (!error.status) console.error('Product import failed:', error.message);
+        const status = error.status || 500;
+        return fail(res, status, status === 413
+          ? 'The spreadsheet request is too large.'
+          : status < 500 ? error.message : 'Products could not be imported. Please try again.');
+      }
     }
     if (method === 'POST' && pathname === '/api/admin/products') {
       const b = await readJson(req, 32 * 1024);
@@ -600,8 +1084,7 @@ async function handleApi(req, res, pathname) {
       if (name.length < 2 || !store.categories.some((item) => item.id === category)
         || !Number.isFinite(price) || price < 0.01 || price > 1000000
         || (stock !== null && (!Number.isInteger(stock) || stock < 0 || stock > 1000000))
-        || (image && !/^\/(?:uploads|images)\/[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*$/.test(image)
-          && !/^https:\/\/res\.cloudinary\.com\/[A-Za-z0-9._/-]+(?:\?[A-Za-z0-9._~!$&'()*+,;=:@%/?-]*)?$/.test(image))) {
+        || !validProductImage(image)) {
         return fail(res, 400, 'Check the product name, category, price, stock quantity, and image URL.');
       }
       const existingId = clean(b.id, 80);
@@ -623,19 +1106,18 @@ async function handleApi(req, res, pathname) {
       };
       if (stock !== null) saved.stock = stock;
       else if (current && Number.isInteger(current.stock)) saved.stock = current.stock;
-      if (current) products = products.map((product) => product.id === id ? saved : product);
-      else products.unshift(saved);
-      productById = new Map(products.map((product) => [product.id, product]));
-      persistProducts();
+      const nextProducts = current
+        ? products.map((product) => product.id === id ? saved : product)
+        : [saved, ...products];
+      await persistProducts(nextProducts);
       return json(res, current ? 200 : 201, { product: saved });
     }
     if (method === 'POST' && pathname === '/api/admin/products/delete') {
       const b = await readJson(req);
       const id = clean(b.id, 80);
       if (!productById.has(id)) return fail(res, 404, 'Product not found.');
-      products = products.filter((product) => product.id !== id);
-      productById = new Map(products.map((product) => [product.id, product]));
-      persistProducts();
+      const nextProducts = products.filter((product) => product.id !== id);
+      await persistProducts(nextProducts);
       return json(res, 200, { success: true });
     }
     if (method === 'POST' && pathname === '/api/admin/upload') {
@@ -656,9 +1138,7 @@ async function handleApi(req, res, pathname) {
       if (!validImage || bytes.length > 4 * 1024 * 1024) return fail(res, 400, 'The uploaded file is not a valid supported image.');
       const extension = mime === 'image/jpeg' ? '.jpg' : mime === 'image/png' ? '.png' : '.webp';
       const filename = crypto.randomBytes(18).toString('hex') + extension;
-      const uploadDir = path.join(PUBLIC, 'uploads');
-      await fs.promises.mkdir(uploadDir, { recursive: true });
-      await fs.promises.writeFile(path.join(uploadDir, filename), bytes, { flag: 'wx', mode: 0o644 });
+      await fs.promises.writeFile(path.join(UPLOADS_DIR, filename), bytes, { flag: 'wx', mode: 0o644 });
       return json(res, 201, { image: '/uploads/' + filename });
     }
   }
@@ -671,9 +1151,15 @@ async function handleApi(req, res, pathname) {
 /* ------------------------------------------------------------------ */
 const server = http.createServer(async (req, res) => {
   try {
-    if (limited(req, 'global', 600, 15 * 60 * 1000)) return fail(res, 429, 'Too many requests. Please slow down.');
     let pathname;
     try { pathname = new URL(req.url, 'http://x').pathname; } catch { return fail(res, 400, 'Bad request.'); }
+
+    if (pathname === '/healthz' && (req.method === 'GET' || req.method === 'HEAD')) {
+      if (database) await database.healthCheck();
+      return json(res, 200, { status: 'ok' }, { 'Cache-Control': 'no-store' });
+    }
+
+    if (limited(req, 'global', 600, 15 * 60 * 1000)) return fail(res, 429, 'Too many requests. Please slow down.');
 
     if (pathname.startsWith('/api/')) {
       if (req.method === 'OPTIONS') return send(res, 204, '', { 'Allow': 'GET, POST' }); // no CORS: same-origin only
@@ -696,4 +1182,48 @@ server.requestTimeout = 20000;
 server.keepAliveTimeout = 5000;
 server.maxHeadersCount = 50;
 
-server.listen(PORT, HOST, () => console.log(`Le-Gacy's Importation running on http://localhost:${PORT}`));
+async function startServer() {
+  await prepareUploadsDirectory();
+  if (database) {
+    const saved = await database.initialize({
+      products,
+      orders: IMPORT_LEGACY_DATA ? orders : [],
+      analytics: IMPORT_LEGACY_DATA ? storeAnalytics : { days: [] }
+    });
+    products = saved.products;
+    orders = saved.orders;
+    storeAnalytics = saved.analytics;
+    productById = new Map(products.map((product) => [product.id, product]));
+    console.log('PostgreSQL connected; database data is ready.');
+  } else {
+    console.warn('DATABASE_URL is not set; using local JSON-file storage.');
+  }
+  server.listen(PORT, HOST, () => console.log(`Le-Gacy's Importation running on http://localhost:${PORT}`));
+}
+
+let shuttingDown = false;
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`${signal} received; shutting down.`);
+  server.close(async (error) => {
+    if (database) await database.close();
+    if (error) {
+      console.error('Could not shut down cleanly:', error.message);
+      process.exitCode = 1;
+    }
+  });
+  setTimeout(() => {
+    console.error('Graceful shutdown timed out.');
+    process.exit(1);
+  }, 10000).unref();
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+
+startServer().catch(async (error) => {
+  console.error('Could not start the server:', error.message);
+  if (database) await database.close();
+  process.exitCode = 1;
+});

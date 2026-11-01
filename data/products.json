@@ -1,36 +1,21 @@
 [
   {
-    "id": "p3-dan",
+    "id": "p3-dan-2",
     "name": "P3 Dan",
     "category": "jewelry-watches",
-    "price": 8,
-    "inStock": true,
+    "price": 89,
+    "inStock": false,
     "preOrder": true,
-    "image": "/uploads/410d5647269c319a28f54cd72459322965c2.png",
-    "description": "jjk",
+    "image": "/uploads/26e6937ba9d9a2790ace5135352800f891a9.jpg",
+    "description": "hgygg",
     "sizes": [
-      "M"
-    ],
-    "colors": [],
-    "stock": 89
-  },
-  {
-    "id": "pack",
-    "name": "pack",
-    "category": "phone-accessories",
-    "price": 29,
-    "inStock": true,
-    "preOrder": true,
-    "image": "/uploads/8a948026eb2b0bf1140aa2518449a5dad806.png",
-    "description": "the bes",
-    "sizes": [
-      "L"
+      "ll"
     ],
     "colors": [
       "White",
       "black"
     ],
-    "stock": 30
+    "stock": 7
   },
   {
     "id": "fast-charger-20w",
@@ -168,7 +153,7 @@
   {
     "id": "mens-leather-sneakers",
     "name": "Men's leather sneakers",
-    "category": "shoes-bags",
+    "category": "mens-shoes",
     "price": 220,
     "inStock": true,
     "image": "",
@@ -190,7 +175,7 @@
   {
     "id": "block-heel-sandals",
     "name": "Women's block heel sandals",
-    "category": "shoes-bags",
+    "category": "womens-shoes",
     "price": 140,
     "inStock": false,
     "preOrder": true,
@@ -297,7 +282,7 @@
   {
     "id": "quick-dry-tshirt",
     "name": "Quick-dry sport T-shirt",
-    "category": "mens-sports",
+    "category": "mens-wear",
     "price": 55,
     "inStock": true,
     "image": "",
@@ -306,7 +291,7 @@
   {
     "id": "jogging-trousers",
     "name": "Jogging trousers",
-    "category": "mens-sports",
+    "category": "mens-wear",
     "price": 95,
     "inStock": true,
     "image": "",

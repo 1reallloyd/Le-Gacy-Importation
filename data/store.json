@@ -9,9 +9,12 @@
     { "id": "phone-accessories", "name": "Phone accessories", "icon": "phone" },
     { "id": "kitchen-home", "name": "Kitchen, storage & cleaning", "icon": "kitchen" },
     { "id": "jewelry-watches", "name": "Jewelry & watches", "icon": "gem" },
-    { "id": "shoes-bags", "name": "Shoes & bags", "icon": "bag" },
-    { "id": "home-textile", "name": "Home textile", "icon": "bed" },
-    { "id": "mens-sports", "name": "Men's, sports & outdoor", "icon": "sport" },
-    { "id": "womens-wear", "name": "Women's lingerie & clothes", "icon": "shirt" }
+    { "id": "mens-sports", "name": "Sports & outdoor", "icon": "sport" },
+    { "id": "mens-wear", "name": "Men's clothing", "icon": "shirt" },
+    { "id": "womens-wear", "name": "Women's clothing & dresses", "icon": "shirt" },
+    { "id": "mens-shoes", "name": "Men & Women's shoes", "icon": "bag" },
+    { "id": "womens-shoes", "name": "Heels", "icon": "bag" },
+    { "id": "shoes-bags", "name": "Bags", "icon": "bag" },
+    { "id": "home-textile", "name": "Home textile", "icon": "bed" }
   ]
 }

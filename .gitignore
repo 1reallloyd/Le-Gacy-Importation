@@ -3,3 +3,8 @@
 !.env.example
 data/orders.json
 data/orders.json.tmp
+data/analytics.json
+data/analytics.json.tmp
+data/products.json.tmp
+node_modules/
+legacys-backup.dump

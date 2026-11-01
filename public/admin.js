@@ -11,6 +11,8 @@
     truck: '<path d="M2 6h11v10H2zM13 10h4l3 3v3h-7"/><circle cx="6.5" cy="17.5" r="1.8"/><circle cx="16.5" cy="17.5" r="1.8"/>',
     people: '<path d="M16 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="10" cy="7" r="4"/><path d="M20 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/>',
     chart: '<path d="M3 3v18h18"/><path d="m19 9-5 5-4-4-5 5"/>',
+    sound: '<path d="M11 5 6 9H3v6h3l5 4z"/><path d="M15.5 8.5a5 5 0 0 1 0 7M18.5 5.5a9 9 0 0 1 0 13"/>',
+    mute: '<path d="M11 5 6 9H3v6h3l5 4z"/><path d="m16 9 5 6m0-6-5 6"/>',
     menu: '<path d="M4 6h16M4 12h16M4 18h16"/>',
     refresh: '<path d="M20 7v5h-5M4 17v-5h5"/><path d="M5.6 9a7 7 0 0 1 11.6-2L20 12M4 12l2.8 5a7 7 0 0 0 11.6-2"/>',
     bell: '<path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9"/><path d="M10 21h4"/>',
@@ -27,9 +29,113 @@
     notifications: [], notificationOpen: false, knownOrderRefs: new Set(), knownProductIds: new Set(),
     knownOrderStatuses: new Map(), knownCustomerKeys: new Set(), knownInventorySignals: new Map(),
     knownProductNames: new Map(),
-    monitorReady: false, pollTimer: null, pollRunning: false, pollErrorNotified: false
+    monitorReady: false, pollTimer: null, pollRunning: false, pollErrorNotified: false,
+    analytics: null, analyticsDays: 30, analyticsLoading: false, analyticsError: '',
+    soundEnabled: true
   };
   const NOTIFICATION_LIMIT = 50;
+  let dashboardAudioContext = null;
+  let analyticsRequestId = 0;
+
+  function soundPreferenceKey(email) {
+    return 'lg_admin_order_sound_' + encodeURIComponent(String(email || '').toLowerCase());
+  }
+
+  function loadSoundPreference(email) {
+    try { return localStorage.getItem(soundPreferenceKey(email)) !== 'off'; }
+    catch { return true; }
+  }
+
+  function saveSoundPreference() {
+    if (!state.email) return;
+    try { localStorage.setItem(soundPreferenceKey(state.email), state.soundEnabled ? 'on' : 'off'); }
+    catch (error) { console.warn('Dashboard sound preference could not be saved:', error.message); }
+  }
+
+  function syncSoundControl() {
+    const button = $('.admin-sound-toggle');
+    if (!button) return;
+    const ready = dashboardAudioContext && dashboardAudioContext.state === 'running';
+    const enabled = state.soundEnabled;
+    const label = enabled ? 'Order sound on' : 'Order sound off';
+    button.setAttribute('aria-label', label);
+    button.setAttribute('aria-pressed', String(enabled));
+    button.title = enabled && !ready
+      ? 'Sound is on. Click or tap the dashboard to activate audio.'
+      : label;
+    button.classList.toggle('is-enabled', enabled);
+    button.replaceChildren(icon(enabled ? 'sound' : 'mute', 17), h('span', { text: label }));
+  }
+
+  function primeDashboardAudio() {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) {
+      syncSoundControl();
+      return;
+    }
+    try {
+      if (!dashboardAudioContext) {
+        dashboardAudioContext = new AudioContextClass();
+        dashboardAudioContext.addEventListener('statechange', syncSoundControl);
+      }
+      if (dashboardAudioContext.state === 'running') {
+        syncSoundControl();
+        return;
+      }
+      dashboardAudioContext.resume().then(() => {
+        syncSoundControl();
+      }).catch((error) => {
+        console.warn('Dashboard sound could not be enabled:', error.message);
+        syncSoundControl();
+      });
+    } catch (error) {
+      console.warn('Dashboard sound could not be enabled:', error.message);
+      syncSoundControl();
+    }
+  }
+
+  function toggleDashboardSound() {
+    if (state.soundEnabled) {
+      state.soundEnabled = false;
+      saveSoundPreference();
+      syncSoundControl();
+      return;
+    }
+    state.soundEnabled = true;
+    saveSoundPreference();
+    primeDashboardAudio();
+    syncSoundControl();
+  }
+
+  function activateDashboardAudio(event) {
+    if (!state.email || !state.soundEnabled
+      || (dashboardAudioContext && dashboardAudioContext.state === 'running')
+      || (event.target instanceof Element && event.target.closest('.admin-sound-toggle'))) return;
+    primeDashboardAudio();
+  }
+
+  function playNewOrderSound() {
+    if (!state.email || !state.soundEnabled || !state.monitorReady
+      || document.visibilityState !== 'visible' || !root.querySelector('.admin-shell')
+      || !dashboardAudioContext || dashboardAudioContext.state !== 'running') return;
+    try {
+      const now = dashboardAudioContext.currentTime;
+      const oscillator = dashboardAudioContext.createOscillator();
+      const gain = dashboardAudioContext.createGain();
+      oscillator.type = 'sine';
+      oscillator.frequency.setValueAtTime(660, now);
+      oscillator.frequency.setValueAtTime(880, now + 0.16);
+      gain.gain.setValueAtTime(0.0001, now);
+      gain.gain.exponentialRampToValueAtTime(0.12, now + 0.025);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.38);
+      oscillator.connect(gain);
+      gain.connect(dashboardAudioContext.destination);
+      oscillator.start(now);
+      oscillator.stop(now + 0.4);
+    } catch (error) {
+      console.warn('New-order sound could not be played:', error.message);
+    }
+  }
 
   function icon(name, size = 18) {
     const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
@@ -177,7 +283,7 @@
   function statusLabel(status) {
     const labels = {
       awaiting_payment: 'Pending', payment_submitted: 'Payment review', confirmed: 'Confirmed',
-      processing: 'Processing', dispatched: 'Shipped', delivered: 'Delivered', cancelled: 'Cancelled'
+      processing: 'Processing your order', dispatched: 'On the way', delivered: 'Delivered', cancelled: 'Cancelled'
     };
     return labels[status] || 'updated';
   }
@@ -225,7 +331,9 @@
     try { data = await response.json(); } catch { /* The server may return an empty response. */ }
     if (!response.ok) {
       if (response.status === 401 && path !== '/api/admin/login') showLogin('Your session expired. Please sign in again.');
-      throw new Error(data.error || 'The request could not be completed.');
+      const error = new Error(data.error || 'The request could not be completed.');
+      error.rows = data.rows;
+      throw error;
     }
     return data;
   }
@@ -238,10 +346,7 @@
     root.replaceChildren(h('section', { class: 'admin-login' },
       h('form', { class: 'admin-login-card', onsubmit: signIn },
         h('a', { class: 'brand', href: '/', 'aria-label': "Le-Gacy's Importation storefront" },
-          h('span', { class: 'brand-mark', text: 'L' }),
-          h('span', { class: 'brand-name' },
-            h('span', { class: 'brand-primary', text: "Le-Gacy's" }),
-            h('span', { class: 'brand-secondary', text: 'Importation' }))),
+          h('img', { class: 'brand-logo', src: '/legacys-logo.svg', alt: '' })),
         h('h1', { text: 'Welcome back' }),
         h('p', { text: 'Sign in to manage your store. Admin access is invitation-only.' }),
         h('div', { class: 'field' }, h('label', { for: 'adminEmail', text: 'Admin email' }),
@@ -260,6 +365,8 @@
     button.textContent = 'Signing in…';
     const email = $('#adminEmail').value.trim();
     const password = $('#adminPassword').value;
+    state.soundEnabled = loadSoundPreference(email);
+    if (state.soundEnabled) primeDashboardAudio();
     try {
       const session = await request('/api/admin/login', { email, password });
       state.email = session.email;
@@ -286,6 +393,54 @@
     state.orders = data.orders;
     state.categories = data.categories;
     state.store = data.store;
+  }
+
+  async function loadAnalytics(days = state.analyticsDays) {
+    const requestId = ++analyticsRequestId;
+    state.analyticsDays = days;
+    state.analyticsLoading = true;
+    state.analyticsError = '';
+    try {
+      const data = await request('/api/admin/analytics?days=' + encodeURIComponent(days));
+      if (requestId === analyticsRequestId) {
+        state.analytics = data;
+        state.analyticsDays = days;
+      }
+      return data;
+    } catch (error) {
+      if (requestId !== analyticsRequestId) return null;
+      state.analyticsError = error.message;
+      throw error;
+    } finally {
+      if (requestId === analyticsRequestId) state.analyticsLoading = false;
+    }
+  }
+
+  function navigateToPage(id) {
+    state.page = id;
+    if (id !== 'performance') {
+      renderShell();
+      return;
+    }
+    const loading = loadAnalytics();
+    renderShell();
+    loading.then(() => {
+      if (state.page === 'performance') renderShell();
+    }).catch((error) => {
+      if (state.page === 'performance') renderShell();
+      toast('Store performance could not be loaded: ' + error.message, true);
+    });
+  }
+
+  function changeAnalyticsRange(days) {
+    const loading = loadAnalytics(days);
+    renderShell();
+    loading.then(() => {
+      if (state.page === 'performance') renderShell();
+    }).catch((error) => {
+      if (state.page === 'performance') renderShell();
+      toast('Store performance could not be loaded: ' + error.message, true);
+    });
   }
 
   function startMonitoring() {
@@ -341,9 +496,12 @@
         .filter((id) => !currentProductIds.has(id))
         .map((id) => ({ id, name: state.knownProductNames.get(id) || id }));
       let updates = 0;
+      let newOrderAlerts = 0;
       newOrders.forEach((order) => {
         state.knownOrderRefs.add(order.ref);
-        updates += addActivityNotification('order:' + order.ref, 'New order received', 'Order ' + order.ref + ' is ready to review.', 'orders');
+        const orderAlert = addActivityNotification('order:' + order.ref, 'New order received', 'Order ' + order.ref + ' is ready to review.', 'orders');
+        updates += orderAlert;
+        newOrderAlerts += orderAlert;
         const customerKey = customerKeyForOrder(order);
         if (customerKey && !state.knownCustomerKeys.has(customerKey)) {
           state.knownCustomerKeys.add(customerKey);
@@ -418,6 +576,7 @@
       state.store = data.store;
       state.pollErrorNotified = false;
       saveNotificationSnapshot();
+      if (newOrderAlerts) playNewOrderSound();
       if (updates) {
         const notificationWrapper = $('.admin-notifications');
         if (notificationWrapper) {
@@ -446,6 +605,7 @@
 
   const pageInfo = {
     overview: ['Overview', 'Here’s what’s happening with your store today.'],
+    performance: ['Store performance', 'Understand visits, sales, and the products customers buy most.'],
     orders: ['Orders', 'Review purchases and keep every order moving.'],
     products: ['Products', 'Manage the products customers see in your store.'],
     inventory: ['Inventory', 'Keep stock levels and availability up to date.'],
@@ -454,6 +614,7 @@
   };
   const navItems = [
     ['overview', 'Overview', 'grid'], ['orders', 'Orders', 'truck'],
+    ['performance', 'Store performance', 'chart'],
     ['products', 'Products', 'bag'], ['inventory', 'Inventory', 'chart'],
     ['customers', 'Customers', 'people'], ['reports', 'Sales reports', 'chart']
   ];
@@ -462,10 +623,7 @@
     const current = pageInfo[state.page] || pageInfo.overview;
     const sidebar = h('aside', { class: 'admin-sidebar', id: 'adminSidebar' },
       h('a', { class: 'brand', href: '/', 'aria-label': "Le-Gacy's Importation storefront" },
-        h('span', { class: 'brand-mark', text: 'L' }),
-        h('span', { class: 'brand-name' },
-          h('span', { class: 'brand-primary', text: "Le-Gacy's" }),
-          h('span', { class: 'brand-secondary', text: 'Importation' }))),
+        h('img', { class: 'brand-logo', src: '/legacys-logo.svg', alt: '' })),
       h('nav', { 'aria-label': 'Admin navigation' },
         h('p', { class: 'admin-nav-label', text: 'Store management' }),
         navItems.map(([id, label, iconName]) => {
@@ -476,7 +634,7 @@
           'aria-label': unread ? label + ', unread updates' : null,
           'data-section': id,
           'data-label': label,
-          onclick: () => { state.page = id; renderShell(); }
+          onclick: () => navigateToPage(id)
           }, icon(iconName), h('span', { text: label }),
           unread ? h('span', { class: 'admin-nav-indicator', 'aria-hidden': 'true' }) : null);
         })),
@@ -492,11 +650,13 @@
         h('div', {}, h('h1', { text: current[0] }), h('p', { text: current[1] }))),
       h('div', { class: 'admin-actions' },
         notificationControl(),
+        h('button', { class: 'admin-sound-toggle', type: 'button', onclick: toggleDashboardSound }),
         h('button', { class: 'admin-icon-btn', type: 'button', 'aria-label': 'Refresh dashboard', title: 'Refresh data', onclick: refreshData }, icon('refresh')),
         h('a', { class: 'btn btn-ghost btn-sm', href: '/', target: '_blank', rel: 'noopener noreferrer', text: 'View store' })));
     const content = h('section', { class: 'admin-content', id: 'adminContent' });
     content.append(renderPage());
     root.replaceChildren(h('div', { class: 'admin-shell' }, sidebar, h('div', { class: 'admin-main' }, topbar, content)));
+    syncSoundControl();
   }
 
   function notificationControl() {
@@ -589,6 +749,7 @@
       }
       const refreshed = await pollForChanges();
       if (!refreshed) return;
+      if (state.page === 'performance') await loadAnalytics();
       renderShell();
       toast('Dashboard data refreshed.');
     } catch (error) { toast(error.message, true); }
@@ -616,6 +777,7 @@
 
   function renderPage() {
     switch (state.page) {
+      case 'performance': return renderPerformance();
       case 'orders': return renderOrders();
       case 'products': return renderProducts();
       case 'inventory': return renderInventory();
@@ -662,6 +824,80 @@
         h('button', { class: 'link', type: 'button', onclick: () => { state.page = 'orders'; renderShell(); }, text: 'All orders' })),
       orderTable(state.orders.slice(0, 5), false));
     return h('div', {}, head, metrics, h('div', { class: 'admin-grid-2' }, chart, statusCard), recent);
+  }
+
+  function renderPerformance() {
+    const range = h('select', {
+      class: 'select admin-range',
+      'aria-label': 'Store performance date range',
+      onchange: (event) => changeAnalyticsRange(Number(event.target.value))
+    }, [[7, 'Last 7 days'], [30, 'Last 30 days'], [90, 'Last 90 days']]
+      .map(([value, label]) => h('option', { value, text: label, selected: state.analyticsDays === value })));
+    const head = pageHeader('Store performance', 'See how many people visit and what customers buy.', range);
+    if (state.analyticsLoading && !state.analytics) {
+      return h('div', {}, head,
+        h('div', { class: 'admin-card admin-performance-loading', 'aria-live': 'polite', text: 'Loading store performance…' }));
+    }
+    if (state.analyticsError && !state.analytics) {
+      return h('div', {}, head,
+        h('div', { class: 'admin-card admin-performance-loading' },
+          h('p', { class: 'admin-error-text', text: 'Store performance could not be loaded: ' + state.analyticsError }),
+          h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: () => changeAnalyticsRange(state.analyticsDays), text: 'Try again' })));
+    }
+    const data = state.analytics || {
+      days: state.analyticsDays, pageViews: 0, uniqueVisitors: 0, paidOrders: 0, itemsSold: 0, revenue: 0, daily: [], topProducts: []
+    };
+    const metrics = h('div', { class: 'admin-metrics' },
+      metric('Visitors', Number(data.uniqueVisitors).toLocaleString(), 'Estimated unique browsers in this period', 'people'),
+      metric('Page views', Number(data.pageViews).toLocaleString(), 'Store pages viewed in this period', 'chart'),
+      metric('Paid orders', Number(data.paidOrders).toLocaleString(), 'Orders confirmed or fulfilled', 'truck'),
+      metric('Sales revenue', money(data.revenue), 'From confirmed and fulfilled orders', 'bag'));
+    const views = data.daily || [];
+    const peakViews = Math.max(...views.map((day) => day.pageViews), 1);
+    const labelEvery = data.days <= 7 ? 1 : data.days <= 30 ? 5 : 15;
+    const trafficChart = h('div', { class: 'admin-card' },
+      h('div', { class: 'admin-card-head' },
+        h('div', {}, h('h3', { text: 'Store visits' }), h('p', { text: 'Page views per day · last ' + data.days + ' days' })),
+        state.analyticsLoading && h('span', { class: 'admin-live-label', text: 'Updating…' })),
+      views.some((day) => day.pageViews)
+        ? h('div', { class: 'admin-traffic-scroll', tabindex: '0', 'aria-label': 'Daily page view chart' },
+          h('div', { class: 'admin-traffic-bars', role: 'img', 'aria-label': 'Daily store page views', style: 'grid-template-columns:repeat(' + views.length + ',minmax(24px,1fr))' },
+            views.map((day, index) => {
+              const date = new Date(day.date + 'T00:00:00Z');
+              const label = index % labelEvery === 0 || index === views.length - 1
+                ? date.toLocaleDateString('en', { month: 'short', day: 'numeric', timeZone: 'UTC' })
+                : '';
+              return h('div', { class: 'admin-traffic-day', title: label + ': ' + day.pageViews + ' page views, ' + day.visitors + ' visitors' },
+                h('span', { class: 'admin-traffic-value', text: day.pageViews ? String(day.pageViews) : '' }),
+                h('div', { class: 'admin-traffic-track' },
+                  h('span', { class: 'admin-traffic-bar', style: 'height:' + (day.pageViews ? Math.max(4, day.pageViews / peakViews * 100) : 0) + '%' })),
+                h('span', { class: 'admin-traffic-date', text: label }));
+            })))
+        : h('div', { class: 'admin-chart-empty', text: 'Store visit data will appear here as customers browse.' }),
+      h('p', { class: 'admin-privacy-note', text: 'Visitor counts are anonymous estimates based on browser storage. One person may count as more than one visitor on different devices. Tracking begins with this update.' }));
+    const products = data.topProducts || [];
+    const productRows = products.map((item, index) =>
+      h('tr', {},
+        h('td', {}, h('div', { class: 'admin-ranked-product' },
+          h('span', { class: 'admin-rank', text: String(index + 1).padStart(2, '0') }),
+          h('strong', { text: item.name }))),
+        h('td', { text: item.category ? categoryName(item.category) : '—' }),
+        h('td', { text: Number(item.quantity).toLocaleString() }),
+        h('td', { text: money(item.revenue) })));
+    const productTable = products.length
+      ? h('div', { class: 'admin-table-wrap' },
+        h('table', { class: 'admin-table' },
+          h('thead', {}, h('tr', {}, ['Product', 'Category', 'Quantity sold', 'Sales'].map((label) => h('th', { text: label })))),
+          h('tbody', {}, productRows)))
+      : h('div', { class: 'admin-empty admin-product-empty' },
+        h('strong', { text: 'No paid purchases in this period yet' }),
+        h('span', { text: 'Popular products will appear here after orders are confirmed.' }));
+    const bestSellers = h('div', { class: 'admin-card admin-section-gap' },
+      h('div', { class: 'admin-card-head' },
+        h('div', {}, h('h3', { text: 'What customers buy most' }), h('p', { text: 'Ranked by quantity in paid orders · ' + data.itemsSold + ' items sold' })),
+        state.analyticsLoading && h('span', { class: 'admin-live-label', text: 'Updating…' })),
+      productTable);
+    return h('div', {}, head, metrics, trafficChart, bestSellers);
   }
 
   function revenueChart(days) {
@@ -732,11 +968,11 @@
 
   function renderOrders() {
     const filters = h('select', { class: 'select', 'aria-label': 'Filter orders', onchange: (event) => { state.filter = event.target.value; renderShell(); } },
-      [['', 'All orders'], ['awaiting_payment', 'Pending'], ['payment_submitted', 'Payment review'], ['confirmed', 'Confirmed'], ['processing', 'Processing'], ['dispatched', 'Shipped'], ['delivered', 'Delivered'], ['cancelled', 'Cancelled']]
+      [['', 'All orders'], ['awaiting_payment', 'Pending'], ['payment_submitted', 'Payment review'], ['confirmed', 'Confirmed'], ['processing', 'Processing your order'], ['dispatched', 'On the way'], ['delivered', 'Delivered'], ['cancelled', 'Cancelled']]
         .map(([value, label]) => h('option', { value, text: label, selected: state.filter === value })));
     const search = h('div', { class: 'search' }, icon('search', 16),
       h('input', { class: 'input', type: 'search', placeholder: 'Search order or customer', 'aria-label': 'Search orders', oninput: (event) => filterTable(event.target.value, '#ordersTable') }));
-    return h('div', {}, pageHeader('Orders', 'Track payments, update fulfillment, and keep customers informed.'),
+    return h('div', {}, pageHeader('Orders', 'Update an order to “Processing your order”, “On the way” or “Delivered” to show customers their progress on Track order.'),
       h('div', { class: 'admin-toolbar' }, search, filters),
       h('div', { id: 'ordersTable' }, orderTable(state.orders.filter((order) => !state.filter || order.status === state.filter), true)));
   }
@@ -745,8 +981,8 @@
     if (order.status === 'awaiting_payment') return ['Pending', 'amber'];
     if (order.status === 'payment_submitted') return ['Payment review', 'amber'];
     if (order.status === 'confirmed') return ['Confirmed', 'purple'];
-    if (order.status === 'processing') return ['Processing', 'purple'];
-    if (order.status === 'dispatched') return ['Shipped', 'green'];
+    if (order.status === 'processing') return ['Processing your order', 'purple'];
+    if (order.status === 'dispatched') return ['On the way', 'green'];
     if (order.status === 'delivered') return ['Delivered', 'green'];
     return ['Cancelled', 'red'];
   }
@@ -762,7 +998,7 @@
           const customer = order.customer || {};
           const productsText = (order.items || []).map((item) => item.qty + ' × ' + item.name).join(', ');
           const statusSelect = h('select', { class: 'select', 'aria-label': 'Update status for ' + order.ref, onchange: (event) => updateOrderStatus(order, event.target) },
-            [['awaiting_payment', 'Pending'], ['payment_submitted', 'Payment review'], ['confirmed', 'Confirmed'], ['processing', 'Processing'], ['dispatched', 'Shipped'], ['delivered', 'Delivered'], ['cancelled', 'Cancelled']]
+            [['awaiting_payment', 'Pending'], ['payment_submitted', 'Payment review'], ['confirmed', 'Payment confirmed'], ['processing', 'Processing your order'], ['dispatched', 'On the way'], ['delivered', 'Delivered'], ['cancelled', 'Cancelled']]
               .map(([value, text]) => h('option', { value, selected: order.status === value, text })));
           return h('tr', { 'data-search': [order.ref, customer.name, customer.phone, customer.email].join(' ').toLowerCase() },
             h('td', {}, h('span', { class: 'admin-order-ref', text: order.ref })),
@@ -781,6 +1017,7 @@
     try {
       const result = await request('/api/admin/status', { ref: order.ref, status: select.value });
       order.status = result.order.status;
+      order.updatedAt = result.order.updatedAt;
       state.knownOrderStatuses.set(order.ref, order.status);
       saveNotificationSnapshot();
       if (previous !== order.status) {
@@ -809,7 +1046,7 @@
   }
 
   function productThumb(product, size = '') {
-    const image = product.image && /^(\/(?:uploads|images)\/[A-Za-z0-9._/-]+|https:\/\/res\.cloudinary\.com\/)/.test(product.image)
+    const image = product.image && (/^\/(?:uploads|images)\//.test(product.image) || /^https:\/\//i.test(product.image))
       ? h('img', { src: product.image, alt: '', loading: 'lazy' }) : icon('image', 20);
     return h('span', { class: 'admin-product-thumb' + (size ? ' ' + size : '') }, image);
   }
@@ -840,10 +1077,13 @@
   }
 
   function renderProducts() {
-    const action = h('button', { class: 'btn', type: 'button', onclick: () => openProductModal() }, icon('plus', 16), h('span', { text: 'Add product' }));
+    const action = h('div', { class: 'admin-actions' },
+      h('button', { class: 'btn btn-ghost', type: 'button', onclick: openBatchImportModal }, h('span', { text: 'Batch upload' })),
+      h('a', { class: 'btn btn-ghost', href: '/product-import-template.csv', download: 'product-import-template.csv' }, h('span', { text: 'Download template' })),
+      h('button', { class: 'btn', type: 'button', onclick: () => openProductModal() }, icon('plus', 16), h('span', { text: 'Add product' })));
     const search = h('div', { class: 'search' }, icon('search', 16),
       h('input', { class: 'input', type: 'search', placeholder: 'Search products', 'aria-label': 'Search products', oninput: (event) => filterTable(event.target.value, '#productsTable') }));
-    return h('div', {}, pageHeader('Products', 'Add, edit, and publish products to your storefront.', action),
+    return h('div', {}, pageHeader('Products', 'Add, edit, publish, or import up to 500 products from an Excel or CSV file.', action),
       h('div', { class: 'admin-toolbar' }, search,
         h('span', { class: 'small muted', text: state.products.length + ' products' })),
       h('div', { id: 'productsTable' }, productTable(state.products)));
@@ -1148,8 +1388,20 @@
     }
   }
 
-  async function removeProduct(product) {
-    if (!window.confirm('Remove "' + product.name + '" from your storefront? Existing order records will be kept.')) return;
+  function removeProduct(product) {
+    const no = h('button', { class: 'btn btn-ghost', type: 'button', text: 'No, keep product', onclick: closeModal });
+    const yes = h('button', { class: 'btn btn-danger', type: 'button', text: 'Yes, delete', onclick: () => deleteProduct(product, yes) });
+    modalRoot.replaceChildren(h('div', { class: 'admin-modal-backdrop', onclick: (event) => { if (event.target === event.currentTarget) closeModal(); } },
+      h('section', { class: 'admin-modal admin-confirm-modal', role: 'alertdialog', 'aria-modal': 'true', 'aria-labelledby': 'deleteProductTitle', 'aria-describedby': 'deleteProductMessage' },
+        h('div', { class: 'admin-modal-head' }, h('div', {},
+          h('h2', { id: 'deleteProductTitle', text: 'Delete product?' }),
+          h('p', { id: 'deleteProductMessage', text: 'Are you sure you want to delete “' + product.name + '”? This removes it from the storefront. Existing order records will be kept.' }))),
+        h('div', { class: 'admin-modal-actions' }, no, yes))));
+    no.focus();
+  }
+
+  async function deleteProduct(product, button) {
+    button.disabled = true;
     try {
       await request('/api/admin/products/delete', { id: product.id });
       state.products = state.products.filter((item) => item.id !== product.id);
@@ -1158,9 +1410,139 @@
       state.knownProductNames.delete(product.id);
       addActivityNotification('product-removed:' + product.id, 'Product removed', product.name + ' was removed from your store.', 'products');
       saveNotificationSnapshot();
+      closeModal();
       renderShell();
       toast('Product removed.');
-    } catch (error) { toast(error.message, true); }
+    } catch (error) {
+      button.disabled = false;
+      toast(error.message, true);
+    }
+  }
+
+  function openBatchImportModal() {
+    let payload = null;
+    const selectedFile = h('input', { class: 'input', type: 'file', accept: '.xlsx,.csv', 'aria-label': 'Choose an Excel or CSV product file' });
+    const feedback = h('div', { class: 'admin-import-feedback', 'aria-live': 'polite' });
+    const previewButton = h('button', { class: 'btn btn-ghost', type: 'button', text: 'Validate and preview', disabled: true });
+    const importButton = h('button', { class: 'btn', type: 'button', text: 'Import products', disabled: true });
+
+    function showErrors(errors) {
+      const shown = errors.slice(0, 50);
+      feedback.replaceChildren(
+        h('p', { class: 'admin-import-error-count', text: 'Found ' + errors.length + ' issue' + (errors.length === 1 ? '' : 's') + (errors.length > shown.length ? '; showing the first ' + shown.length + '.' : '.') }),
+        h('ul', { class: 'admin-import-errors' }, shown.map((item) => h('li', { text: 'Row ' + item.row + ': ' + item.message }))));
+    }
+
+    async function readSelectedFile(file) {
+      if (file.size > 5 * 1024 * 1024) throw new Error('Choose a spreadsheet smaller than 5 MB.');
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      let binary = '';
+      for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+        binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+      }
+      return { fileName: file.name, data: btoa(binary) };
+    }
+
+    selectedFile.addEventListener('change', () => {
+      payload = null;
+      previewButton.disabled = !selectedFile.files || !selectedFile.files[0];
+      importButton.disabled = true;
+      feedback.replaceChildren();
+    });
+
+    previewButton.addEventListener('click', async () => {
+      const file = selectedFile.files && selectedFile.files[0];
+      if (!file) return;
+      previewButton.disabled = true;
+      previewButton.textContent = 'Checking file…';
+      importButton.disabled = true;
+      feedback.replaceChildren();
+      try {
+        payload = await readSelectedFile(file);
+        const result = await request('/api/admin/products/import/preview', payload);
+        if (!result.valid) {
+          showErrors(result.errors || [{ row: 1, message: 'The spreadsheet is invalid.' }]);
+          return;
+        }
+        const previewContent = [
+          h('p', { class: 'admin-import-success', text: 'Ready to import ' + result.added + ' new product' + (result.added === 1 ? '' : 's') + ' and update ' + result.updated + ' existing product' + (result.updated === 1 ? '' : 's') + '.' }),
+          h('div', { class: 'admin-import-preview-wrap' }, h('table', { class: 'admin-table admin-import-preview' },
+            h('thead', {}, h('tr', {}, ['Action', 'ID', 'Product', 'Price'].map((label) => h('th', { text: label })))),
+            h('tbody', {}, result.products.slice(0, 12).map((product) => h('tr', {},
+              h('td', { text: product.action === 'add' ? 'Add' : 'Update' }),
+              h('td', { text: product.id }),
+              h('td', { text: product.name }),
+              h('td', { text: money(product.price) }))))))
+        ];
+        if (result.products.length > 12) {
+          previewContent.push(h('p', { class: 'small muted', text: 'Showing 12 of ' + result.products.length + ' products.' }));
+        }
+        feedback.replaceChildren(...previewContent);
+        importButton.disabled = false;
+      } catch (error) {
+        if (error.rows) showErrors(error.rows);
+        else feedback.replaceChildren(h('p', { class: 'admin-import-error-count', text: error.message }));
+      } finally {
+        previewButton.disabled = false;
+        previewButton.textContent = 'Validate and preview';
+      }
+    });
+
+    importButton.addEventListener('click', async () => {
+      if (!payload) return;
+      importButton.disabled = true;
+      importButton.textContent = 'Importing…';
+      previewButton.disabled = true;
+      try {
+        const result = await request('/api/admin/products/import', payload);
+        const importedById = new Map(result.products.map((product) => [product.id, product]));
+        const additions = result.products.filter((product) => !state.products.some((current) => current.id === product.id));
+        state.products = [...additions, ...state.products.map((product) => importedById.get(product.id) || product)];
+        state.products.forEach((product) => {
+          state.knownProductIds.add(product.id);
+          state.knownProductNames.set(product.id, product.name);
+          state.knownInventorySignals.set(product.id, inventorySignal(product));
+        });
+        saveNotificationSnapshot();
+        const importMessage = [
+          result.added + ' added',
+          result.updated + ' updated'
+        ].join(', ');
+        addActivityNotification(
+          'product-import:' + Date.now(),
+          'Product batch uploaded',
+          importMessage + ' successfully.',
+          'products'
+        );
+        closeModal();
+        renderShell();
+        toast('Imported ' + result.added + ' new product' + (result.added === 1 ? '' : 's') + ' and updated ' + result.updated + '.');
+      } catch (error) {
+        if (error.rows) showErrors(error.rows);
+        else feedback.replaceChildren(h('p', { class: 'admin-import-error-count', text: error.message }));
+        importButton.disabled = false;
+        importButton.textContent = 'Import products';
+        previewButton.disabled = false;
+      }
+    });
+
+    modalRoot.replaceChildren(h('div', { class: 'admin-modal-backdrop', onclick: (event) => { if (event.target === event.currentTarget) closeModal(); } },
+      h('section', { class: 'admin-modal admin-import-modal', role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': 'batchImportTitle' },
+        h('div', { class: 'admin-modal-head' }, h('div', {},
+          h('h2', { id: 'batchImportTitle', text: 'Batch upload products' }),
+          h('p', { text: 'Upload an .xlsx or .csv file. Products are validated together before anything is saved.' })),
+        h('button', { class: 'admin-icon-btn', type: 'button', 'aria-label': 'Close dialog', onclick: closeModal }, icon('close', 16))),
+        h('div', { class: 'admin-import-guidance' },
+          h('strong', { text: 'Required columns: name, category, price.' }),
+          h('p', { text: 'Use category names or IDs from your store. A supplied ID updates a match or becomes the new product ID; blank IDs are generated. Use qty for the optional stock quantity; stock is accepted as an older-file alias. Blank optional cells preserve existing values. Separate sizes and colors with commas. Add a direct, publicly accessible HTTPS image URL from any image host, or add an image later by editing the product.' })),
+        h('div', { class: 'field admin-import-file-field' }, h('label', { for: 'productImportFile', text: 'Excel or CSV file · maximum 5 MB · 500 products' }),
+          Object.assign(selectedFile, { id: 'productImportFile' })),
+        feedback,
+        h('div', { class: 'admin-modal-actions' },
+          h('button', { class: 'btn btn-ghost', type: 'button', onclick: closeModal, text: 'Cancel' }),
+          previewButton,
+          importButton))));
+    selectedFile.focus();
   }
 
   function closeModal() {
@@ -1184,6 +1566,7 @@
         return;
       }
       state.email = session.email;
+      state.soundEnabled = loadSoundPreference(session.email);
       await loadData();
       startMonitoring();
       renderShell();
@@ -1203,6 +1586,8 @@
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') pollForChanges();
   });
+  document.addEventListener('pointerdown', activateDashboardAudio, true);
+  document.addEventListener('keydown', activateDashboardAudio, true);
   window.addEventListener('focus', () => pollForChanges());
   window.addEventListener('storage', (event) => {
     if (event.key !== notificationStorageKey()) return;
