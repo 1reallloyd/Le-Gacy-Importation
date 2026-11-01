@@ -8,11 +8,15 @@
     "start": "node server.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "dependencies": {
+    "@vercel/blob": "^2.8.2",
     "csv-parse": "^7.0.3",
     "pg": "^8.13.1",
     "read-excel-file": "^9.3.14"
+  },
+  "overrides": {
+    "zod": "^4.6.7"
   }
 }

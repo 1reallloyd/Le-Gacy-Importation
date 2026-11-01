@@ -1267,21 +1267,22 @@
       if (!selected) return;
       if (selected.size > 4 * 1024 * 1024) { file.value = ''; toast('Choose an image smaller than 4 MB.', true); return; }
       if (!['image/jpeg', 'image/png', 'image/webp'].includes(selected.type)) { file.value = ''; toast('Choose a JPG, PNG, or WebP image.', true); return; }
-      const reader = new FileReader();
-      reader.onload = () => {
-        const result = String(reader.result || '');
-        const base64 = result.split(',')[1];
-        if (!base64) { toast('The image could not be read.', true); return; }
-        request('/api/admin/upload', { filename: selected.name, mime: selected.type, data: base64 })
-          .then((response) => {
-            image = response.image;
-            preview.replaceChildren(h('img', { src: image, alt: 'Product image preview' }));
-            imageHint.textContent = 'Image uploaded and ready.';
-            toast('Product image uploaded.');
-          }).catch((error) => toast(error.message, true));
-      };
-      reader.onerror = () => toast('The selected image could not be read.', true);
-      reader.readAsDataURL(selected);
+      fetch('/api/admin/upload', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': selected.type },
+        body: selected
+      }).then(async (response) => {
+        let data = {};
+        try { data = await response.json(); } catch { /* The server may return an empty response. */ }
+        if (!response.ok) throw new Error(data.error || 'The image could not be uploaded.');
+        return data;
+      }).then((response) => {
+        image = response.image;
+        preview.replaceChildren(h('img', { src: image, alt: 'Product image preview' }));
+        imageHint.textContent = 'Image uploaded and ready.';
+        toast('Product image uploaded.');
+      }).catch((error) => toast(error.message, true));
     });
     const form = h('form', { onsubmit: (event) => saveProduct(event, current, product, image, save) });
     const name = h('input', { class: 'input', name: 'name', required: true, maxlength: '100', value: current.name, placeholder: 'e.g. Wireless earbuds' });

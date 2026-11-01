@@ -42,7 +42,8 @@ const PORT = Number(process.env.PORT) || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
 const TRUST_PROXY = process.env.TRUST_PROXY === '1'; // set when behind Nginx/Vercel/Render etc.
 const IS_PROD = process.env.NODE_ENV === 'production';
-const IMPORT_LEGACY_DATA = process.env.IMPORT_LEGACY_DATA === '1' || !IS_PROD;
+const IS_VERCEL = process.env.VERCEL === '1';
+const IMPORT_LEGACY_DATA = process.env.IMPORT_LEGACY_DATA === '1' || (!IS_PROD && !IS_VERCEL);
 const DATABASE_URL = String(process.env.DATABASE_URL || '').trim();
 if (IS_PROD && !DATABASE_URL) {
   throw new Error('Set DATABASE_URL to a PostgreSQL connection string before starting in production.');
@@ -83,6 +84,7 @@ const store = JSON.parse(fs.readFileSync(path.join(DATA, 'store.json'), 'utf8'))
 let products = JSON.parse(fs.readFileSync(PRODUCTS_FILE, 'utf8'));
 let productById = new Map(products.map((p) => [p.id, p]));
 const database = DATABASE_URL ? require('./database') : null;
+let databaseReady = false;
 
 async function prepareUploadsDirectory() {
   await fs.promises.mkdir(UPLOADS_DIR, { recursive: true });
@@ -533,12 +535,13 @@ function adminSessionId(req) {
   return '';
 }
 
-function adminAuthorised(req) {
+async function adminAuthorised(req) {
   const id = adminSessionId(req);
-  const session = id && adminSessions.get(id);
+  const session = id && (database ? await database.getAdminSession(id) : adminSessions.get(id));
   if (!session) return false;
   if (session.expiresAt <= Date.now()) {
-    adminSessions.delete(id);
+    if (database) await database.deleteAdminSession(id);
+    else adminSessions.delete(id);
     return false;
   }
   return true;
@@ -601,25 +604,21 @@ function clientIp(req) {
 /* Rate limiting (fixed window, in memory)                            */
 /* ------------------------------------------------------------------ */
 const buckets = new Map();
-function limited(req, name, max, windowMs) {
+async function limited(req, name, max, windowMs) {
   const key = name + '|' + clientIp(req);
+  if (database) {
+    const bucket = await database.incrementRateLimit(key, windowMs);
+    return bucket.count > max;
+  }
   const now = Date.now();
   let b = buckets.get(key);
   if (!b || b.reset <= now) { b = { count: 0, reset: now + windowMs }; buckets.set(key, b); }
   b.count += 1;
   return b.count > max;
 }
-function adminLoginFailureCount(req) {
+async function recordAdminLoginFailure(req) {
   const key = clientIp(req);
-  const bucket = adminLoginFailures.get(key);
-  if (!bucket || bucket.reset <= Date.now()) {
-    adminLoginFailures.delete(key);
-    return 0;
-  }
-  return bucket.count;
-}
-function recordAdminLoginFailure(req) {
-  const key = clientIp(req);
+  if (database) return database.incrementRateLimit('admin-login|' + key, ADMIN_LOGIN_WINDOW_MS);
   const now = Date.now();
   let bucket = adminLoginFailures.get(key);
   if (!bucket || bucket.reset <= now) {
@@ -633,6 +632,11 @@ setInterval(() => {
   const now = Date.now();
   for (const [k, b] of buckets) if (b.reset <= now) buckets.delete(k);
   for (const [k, b] of adminLoginFailures) if (b.reset <= now) adminLoginFailures.delete(k);
+  if (database && databaseReady) {
+    database.pruneAuthState().catch((error) => {
+      console.error('Could not prune expired authentication data:', error.message);
+    });
+  }
 }, 60 * 1000).unref();
 
 /* ------------------------------------------------------------------ */
@@ -695,6 +699,27 @@ function readJson(req, limit = 10 * 1024) {
   });
 }
 
+function readBuffer(req, limit) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    let tooLarge = false;
+    const chunks = [];
+    req.on('data', (chunk) => {
+      size += chunk.length;
+      if (size > limit) {
+        tooLarge = true;
+        return;
+      }
+      if (!tooLarge) chunks.push(chunk);
+    });
+    req.on('end', () => {
+      if (tooLarge) return reject(Object.assign(new Error('too large'), { status: 413 }));
+      resolve(Buffer.concat(chunks));
+    });
+    req.on('error', () => reject(Object.assign(new Error('read'), { status: 400 })));
+  });
+}
+
 /* ------------------------------------------------------------------ */
 /* Static files                                                       */
 /* ------------------------------------------------------------------ */
@@ -744,7 +769,7 @@ async function handleApi(req, res, pathname) {
 
   if (method === 'POST' && pathname === '/api/store/visit') {
     if (!sameOrigin(req)) return fail(res, 403, 'Request rejected.');
-    if (limited(req, 'store-visit', 120, 15 * 60 * 1000)) return fail(res, 429, 'Too many visits recorded. Please try again later.');
+    if (await limited(req, 'store-visit', 120, 15 * 60 * 1000)) return fail(res, 429, 'Too many visits recorded. Please try again later.');
     const body = await readJson(req, 1024);
     const visitorId = typeof body.visitorId === 'string' ? body.visitorId : '';
     if (!/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(visitorId)) {
@@ -776,7 +801,7 @@ async function handleApi(req, res, pathname) {
 
   /* ---- create order ---- */
   if (method === 'POST' && pathname === '/api/orders') {
-    if (limited(req, 'order', 10, 60 * 60 * 1000)) return fail(res, 429, 'Too many orders from this device. Please try again later or contact us on WhatsApp.');
+    if (await limited(req, 'order', 10, 60 * 60 * 1000)) return fail(res, 429, 'Too many orders from this device. Please try again later or contact us on WhatsApp.');
     const b = await readJson(req);
     if (b.website) return fail(res, 400, 'Request rejected.'); // honeypot field, humans never fill it
 
@@ -851,7 +876,7 @@ async function handleApi(req, res, pathname) {
 
   /* ---- create Paystack payment reference ---- */
   if (method === 'POST' && pathname === '/api/orders/paystack/reference') {
-    if (limited(req, 'paystack-reference', 20, 15 * 60 * 1000)) return fail(res, 429, 'Too many payment attempts. Please wait and try again.');
+    if (await limited(req, 'paystack-reference', 20, 15 * 60 * 1000)) return fail(res, 429, 'Too many payment attempts. Please wait and try again.');
     if (!PAYSTACK_CONFIGURED) return fail(res, 503, 'Online payment is not available right now. Please contact us on WhatsApp.');
     const b = await readJson(req);
     const ref = clean(b.ref, 20).toUpperCase();
@@ -871,7 +896,7 @@ async function handleApi(req, res, pathname) {
 
   /* ---- verify Paystack payment server-side ---- */
   if (method === 'POST' && pathname === '/api/orders/paystack/verify') {
-    if (limited(req, 'paystack-verify', 20, 15 * 60 * 1000)) return fail(res, 429, 'Too many payment checks. Please wait and try again.');
+    if (await limited(req, 'paystack-verify', 20, 15 * 60 * 1000)) return fail(res, 429, 'Too many payment checks. Please wait and try again.');
     if (!PAYSTACK_CONFIGURED) return fail(res, 503, 'Online payment is not available right now. Please contact us on WhatsApp.');
     const b = await readJson(req);
     const ref = clean(b.ref, 20).toUpperCase();
@@ -931,7 +956,7 @@ async function handleApi(req, res, pathname) {
 
   /* ---- track / fetch own order ---- */
   if (method === 'POST' && pathname === '/api/orders/track') {
-    if (limited(req, 'track', 20, 15 * 60 * 1000)) return fail(res, 429, 'Too many attempts. Please wait a few minutes and try again.');
+    if (await limited(req, 'track', 20, 15 * 60 * 1000)) return fail(res, 429, 'Too many attempts. Please wait a few minutes and try again.');
     const b = await readJson(req);
     const ref = clean(b.ref, 20).toUpperCase();
     const phone = normalizePhone(b.phone);
@@ -942,7 +967,7 @@ async function handleApi(req, res, pathname) {
 
   /* ---- submit Mobile Money payment details ---- */
   if (method === 'POST' && pathname === '/api/orders/pay') {
-    if (limited(req, 'pay', 15, 15 * 60 * 1000)) return fail(res, 429, 'Too many attempts. Please wait a few minutes and try again.');
+    if (await limited(req, 'pay', 15, 15 * 60 * 1000)) return fail(res, 429, 'Too many attempts. Please wait a few minutes and try again.');
     const b = await readJson(req);
     const ref = clean(b.ref, 20).toUpperCase();
     const phone = normalizePhone(b.phone);
@@ -971,42 +996,48 @@ async function handleApi(req, res, pathname) {
 
   /* ---- admin ---- */
   if (pathname.startsWith('/api/admin/')) {
-    if (limited(req, 'admin', 300, 15 * 60 * 1000)) return fail(res, 429, 'Too many requests.');
+    if (await limited(req, 'admin', 300, 15 * 60 * 1000)) return fail(res, 429, 'Too many requests.');
     if (method === 'POST' && !sameOrigin(req)) return fail(res, 403, 'Request rejected.');
     if (method === 'POST' && pathname === '/api/admin/login') {
-      if (adminLoginFailureCount(req) >= ADMIN_LOGIN_FAILURE_LIMIT) {
-        return fail(res, 429, 'Too many incorrect sign-in attempts. Please wait 15 minutes before trying again.');
-      }
       const b = await readJson(req);
       const email = typeof b.email === 'string' ? b.email.trim().toLowerCase().slice(0, 254) : '';
       const password = typeof b.password === 'string' && b.password.length <= 256 ? b.password : '';
-      recordAdminLoginFailure(req);
+      const failures = await recordAdminLoginFailure(req);
+      if (failures.count > ADMIN_LOGIN_FAILURE_LIMIT) {
+        return fail(res, 429, 'Too many incorrect sign-in attempts. Please wait 15 minutes before trying again.');
+      }
       const passwordHash = await new Promise((resolve, reject) => {
         crypto.scrypt(password, ADMIN_PASSWORD_SALT, 64, (error, derived) => error ? reject(error) : resolve(derived));
       });
       const credentialsMatch = Number(safeEqual(email, ADMIN_EMAIL)) & Number(crypto.timingSafeEqual(passwordHash, ADMIN_PASSWORD_HASH));
       if (!credentialsMatch) {
-        if (adminLoginFailureCount(req) >= ADMIN_LOGIN_FAILURE_LIMIT) {
+        if (failures.count >= ADMIN_LOGIN_FAILURE_LIMIT) {
           return fail(res, 429, 'Too many incorrect sign-in attempts. Please wait 15 minutes before trying again.');
         }
         return fail(res, 401, 'Email or password is incorrect.');
       }
 
       const id = crypto.randomBytes(32).toString('hex');
-      adminSessions.set(id, { expiresAt: Date.now() + ADMIN_SESSION_TTL });
+      const expiresAt = Date.now() + ADMIN_SESSION_TTL;
+      if (database) await database.saveAdminSession(id, expiresAt);
+      else adminSessions.set(id, { expiresAt });
+      if (database) await database.clearRateLimit('admin-login|' + clientIp(req));
       adminLoginFailures.delete(clientIp(req));
       return json(res, 200, { email: ADMIN_EMAIL }, { 'Set-Cookie': adminCookie(id, ADMIN_SESSION_TTL / 1000) });
     }
     if (method === 'GET' && pathname === '/api/admin/session') {
-      if (!adminAuthorised(req)) return json(res, 200, { authenticated: false });
+      if (!await adminAuthorised(req)) return json(res, 200, { authenticated: false });
       return json(res, 200, { authenticated: true, email: ADMIN_EMAIL });
     }
     if (method === 'POST' && pathname === '/api/admin/logout') {
       const id = adminSessionId(req);
-      if (id) adminSessions.delete(id);
+      if (id) {
+        if (database) await database.deleteAdminSession(id);
+        else adminSessions.delete(id);
+      }
       return json(res, 200, { success: true }, { 'Set-Cookie': adminCookie('', 0) });
     }
-    if (!adminAuthorised(req)) {
+    if (!await adminAuthorised(req)) {
       return fail(res, 401, 'Not authorised.');
     }
     if (method === 'GET' && pathname === '/api/admin/dashboard') {
@@ -1121,15 +1152,12 @@ async function handleApi(req, res, pathname) {
       return json(res, 200, { success: true });
     }
     if (method === 'POST' && pathname === '/api/admin/upload') {
-      const b = await readJson(req, 6 * 1024 * 1024);
-      const mime = String(b.mime || '');
-      const data = String(b.data || '');
-      if (!['image/jpeg', 'image/png', 'image/webp'].includes(mime)
-        || !data || data.length > 4 * 1024 * 1024 * 4 / 3 + 8
-        || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(data)) {
+      const mime = String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+      if (!sameOrigin(req)) return fail(res, 403, 'Request rejected.');
+      if (!['image/jpeg', 'image/png', 'image/webp'].includes(mime)) {
         return fail(res, 400, 'Choose a valid JPG, PNG, or WebP image smaller than 4 MB.');
       }
-      const bytes = Buffer.from(data, 'base64');
+      const bytes = await readBuffer(req, 4 * 1024 * 1024);
       const validImage = mime === 'image/png'
         ? bytes.length > 8 && bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
         : mime === 'image/jpeg'
@@ -1138,6 +1166,15 @@ async function handleApi(req, res, pathname) {
       if (!validImage || bytes.length > 4 * 1024 * 1024) return fail(res, 400, 'The uploaded file is not a valid supported image.');
       const extension = mime === 'image/jpeg' ? '.jpg' : mime === 'image/png' ? '.png' : '.webp';
       const filename = crypto.randomBytes(18).toString('hex') + extension;
+      if (IS_VERCEL) {
+        const { put } = require('@vercel/blob');
+        const blob = await put('uploads/' + filename, bytes, {
+          access: 'public',
+          contentType: mime,
+          addRandomSuffix: false
+        });
+        return json(res, 201, { image: blob.url });
+      }
       await fs.promises.writeFile(path.join(UPLOADS_DIR, filename), bytes, { flag: 'wx', mode: 0o644 });
       return json(res, 201, { image: '/uploads/' + filename });
     }
@@ -1149,8 +1186,9 @@ async function handleApi(req, res, pathname) {
 /* ------------------------------------------------------------------ */
 /* Server                                                             */
 /* ------------------------------------------------------------------ */
-const server = http.createServer(async (req, res) => {
+async function handleRequest(req, res) {
   try {
+    await ensureInitialized();
     let pathname;
     try { pathname = new URL(req.url, 'http://x').pathname; } catch { return fail(res, 400, 'Bad request.'); }
 
@@ -1159,7 +1197,15 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { status: 'ok' }, { 'Cache-Control': 'no-store' });
     }
 
-    if (limited(req, 'global', 600, 15 * 60 * 1000)) return fail(res, 429, 'Too many requests. Please slow down.');
+    if (pathname.startsWith('/api/') && database) {
+      const current = await database.loadState();
+      products = current.products;
+      orders = current.orders;
+      storeAnalytics = current.analytics;
+      productById = new Map(products.map((product) => [product.id, product]));
+    }
+
+    if (await limited(req, 'global', 600, 15 * 60 * 1000)) return fail(res, 429, 'Too many requests. Please slow down.');
 
     if (pathname.startsWith('/api/')) {
       if (req.method === 'OPTIONS') return send(res, 204, '', { 'Allow': 'GET, POST' }); // no CORS: same-origin only
@@ -1175,29 +1221,42 @@ const server = http.createServer(async (req, res) => {
     if (!res.headersSent) return fail(res, status, msg);
     res.end();
   }
-});
+}
 
+const server = http.createServer(handleRequest);
 server.headersTimeout = 15000;
 server.requestTimeout = 20000;
 server.keepAliveTimeout = 5000;
 server.maxHeadersCount = 50;
 
-async function startServer() {
-  await prepareUploadsDirectory();
-  if (database) {
-    const saved = await database.initialize({
-      products: IMPORT_LEGACY_DATA ? products : [],
-      orders: IMPORT_LEGACY_DATA ? orders : [],
-      analytics: IMPORT_LEGACY_DATA ? storeAnalytics : { days: [] }
-    });
-    products = saved.products;
-    orders = saved.orders;
-    storeAnalytics = saved.analytics;
-    productById = new Map(products.map((product) => [product.id, product]));
-    console.log('PostgreSQL connected; database data is ready.');
-  } else {
-    console.warn('DATABASE_URL is not set; using local JSON-file storage.');
+let initialization;
+async function ensureInitialized() {
+  if (!initialization) {
+    initialization = (async () => {
+      if (!IS_VERCEL) await prepareUploadsDirectory();
+      if (!database) {
+        console.warn('DATABASE_URL is not set; using local JSON-file storage.');
+        return;
+      }
+      const saved = await database.initialize({
+        products: IMPORT_LEGACY_DATA ? products : [],
+        orders: IMPORT_LEGACY_DATA ? orders : [],
+        analytics: IMPORT_LEGACY_DATA ? storeAnalytics : { days: [] }
+      });
+      products = saved.products;
+      orders = saved.orders;
+      storeAnalytics = saved.analytics;
+      productById = new Map(products.map((product) => [product.id, product]));
+      await database.pruneAuthState();
+      databaseReady = true;
+      console.log('PostgreSQL connected; database data is ready.');
+    })();
   }
+  return initialization;
+}
+
+async function startServer() {
+  await ensureInitialized();
   server.listen(PORT, HOST, () => console.log(`Le-Gacy's Importation running on http://localhost:${PORT}`));
 }
 
@@ -1219,11 +1278,14 @@ function shutdown(signal) {
   }, 10000).unref();
 }
 
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT', () => shutdown('SIGINT'));
+if (require.main === module) {
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  startServer().catch(async (error) => {
+    console.error('Could not start the server:', error.message);
+    if (database) await database.close();
+    process.exitCode = 1;
+  });
+}
 
-startServer().catch(async (error) => {
-  console.error('Could not start the server:', error.message);
-  if (database) await database.close();
-  process.exitCode = 1;
-});
+module.exports = { handler: handleRequest };
