@@ -20,7 +20,7 @@ const crypto = require('crypto');
 const { parse: parseCsv } = require('csv-parse/sync');
 const { readSheet } = require('read-excel-file/node');
 
-const ROOT = __dirname;
+const ROOT = fs.existsSync(path.join(process.cwd(), 'data')) ? process.cwd() : __dirname;
 const ENV_FILE = path.join(ROOT, '.env');
 
 if (fs.existsSync(ENV_FILE)) {
@@ -603,11 +603,11 @@ function publicOrder(o) {
 }
 
 function clientIp(req) {
-  if (TRUST_PROXY) {
+  if (TRUST_PROXY && req && req.headers) {
     const xff = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
     if (xff) return xff;
   }
-  return req.socket.remoteAddress || 'unknown';
+  return (req && req.socket && req.socket.remoteAddress) || 'unknown';
 }
 
 /* ------------------------------------------------------------------ */
@@ -739,35 +739,51 @@ const MIME = {
   '.csv': 'text/csv; charset=utf-8', '.json': 'application/json', '.webmanifest': 'application/manifest+json', '.txt': 'text/plain; charset=utf-8'
 };
 
-function serveStatic(req, res, pathname) {
+async function serveStatic(req, res, pathname) {
   let rel;
   try { rel = decodeURIComponent(pathname); } catch { return fail(res, 400, 'Bad request.'); }
   if (rel.includes('\0')) return fail(res, 400, 'Bad request.');
   if (rel === '/') rel = '/index.html';
   const isUpload = rel.startsWith('/uploads/');
   const root = isUpload ? UPLOADS_DIR : PUBLIC;
-  const relativePath = isUpload ? rel.slice('/uploads/'.length) : rel.replace(/^[/\\]/, '');
+  const relativePath = isUpload ? rel.slice('/uploads/'.length) : rel.replace(/^[\/\\]/, '');
   const file = path.resolve(root, relativePath);
   if (file !== root && !file.startsWith(root + path.sep)) return fail(res, 403, 'Forbidden.');
-  fs.stat(file, (err, st) => {
-    if (err || !st.isFile()) {
-      // Unknown path with an extension => 404; clean paths fall back to the app shell.
-      if (path.extname(rel)) return send(res, 404, 'Not found', { 'Content-Type': 'text/plain; charset=utf-8' });
-      return serveStatic(req, res, '/index.html');
-    }
-    const ext = path.extname(file).toLowerCase();
-    const headers = {
-      'Content-Type': MIME[ext] || 'application/octet-stream',
-      'Content-Length': st.size,
-      'Cache-Control': ext === '.html' ? 'no-cache' : 'public, max-age=3600'
-    };
-    if (path.basename(file) === 'admin.html') {
-      headers['X-Robots-Tag'] = 'noindex, nofollow';
-      headers['Cache-Control'] = 'no-store';
-    }
-    res.writeHead(200, Object.assign({}, SECURITY_HEADERS, headers));
-    if (req.method === 'HEAD') return res.end();
-    fs.createReadStream(file).pipe(res);
+
+  let st;
+  try {
+    st = await fs.promises.stat(file);
+    if (!st.isFile()) throw new Error('Not a file');
+  } catch {
+    if (path.extname(rel)) return send(res, 404, 'Not found', { 'Content-Type': 'text/plain; charset=utf-8' });
+    return await serveStatic(req, res, '/index.html');
+  }
+
+  const ext = path.extname(file).toLowerCase();
+  const headers = {
+    'Content-Type': MIME[ext] || 'application/octet-stream',
+    'Content-Length': st.size,
+    'Cache-Control': ext === '.html' ? 'no-cache' : 'public, max-age=3600'
+  };
+  if (path.basename(file) === 'admin.html') {
+    headers['X-Robots-Tag'] = 'noindex, nofollow';
+    headers['Cache-Control'] = 'no-store';
+  }
+  res.writeHead(200, Object.assign({}, SECURITY_HEADERS, headers));
+  if (req.method === 'HEAD') {
+    res.end();
+    return;
+  }
+
+  return new Promise((resolve, reject) => {
+    const stream = fs.createReadStream(file);
+    stream.on('error', (err) => {
+      if (!res.headersSent) fail(res, 500, 'Failed to read file.');
+      reject(err);
+    });
+    res.on('finish', resolve);
+    res.on('close', resolve);
+    stream.pipe(res);
   });
 }
 
@@ -1241,8 +1257,8 @@ async function handleRequest(req, res) {
       return await handleApi(req, res, pathname);
     }
     if (req.method !== 'GET' && req.method !== 'HEAD') return fail(res, 405, 'Method not allowed.');
-    if (pathname === '/dashboard' || pathname === '/dashboard/') return serveStatic(req, res, '/admin.html');
-    return serveStatic(req, res, pathname);
+    if (pathname === '/dashboard' || pathname === '/dashboard/') return await serveStatic(req, res, '/admin.html');
+    return await serveStatic(req, res, pathname);
   } catch (err) {
     const status = err && err.status ? err.status : 500;
     if (status === 500) console.error('Unhandled error:', err && err.message);
