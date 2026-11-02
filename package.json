@@ -5,6 +5,7 @@
   "description": "Le-Gacy's Importation online store",
   "main": "server.js",
   "scripts": {
+    "dev": "node --env-file-if-exists=.env.development.local server.js",
     "start": "node server.js"
   },
   "engines": {
