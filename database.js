@@ -2,19 +2,31 @@
 
 const { Pool } = require('pg');
 
-const pool = new Pool({
+function getSslConfig() {
+  const url = String(process.env.DATABASE_URL || '');
+  if (!url || url.includes('localhost') || url.includes('127.0.0.1') || url.includes('sslmode=disable')) {
+    return false;
+  }
+  return { rejectUnauthorized: false };
+}
+
+const pool = process.env.DATABASE_URL ? new Pool({
   connectionString: process.env.DATABASE_URL,
-  connectionTimeoutMillis: 5000,
+  ssl: getSslConfig(),
+  connectionTimeoutMillis: 10000,
   idleTimeoutMillis: 30000,
   max: process.env.VERCEL === '1' ? 1 : 10,
   allowExitOnIdle: process.env.VERCEL === '1'
-});
+}) : null;
 
-pool.on('error', (error) => {
-  console.error('Unexpected PostgreSQL pool error:', error.message);
-});
+if (pool) {
+  pool.on('error', (error) => {
+    console.error('Unexpected PostgreSQL pool error:', error.message);
+  });
+}
 
 async function transaction(callback) {
+  if (!pool) throw new Error('Database connection not configured');
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -31,16 +43,18 @@ async function transaction(callback) {
 
 async function saveProductRows(client, products) {
   for (const [position, product] of products.entries()) {
+    const data = typeof product === 'string' ? product : JSON.stringify(product);
     await client.query(
       `INSERT INTO products (id, position, data)
        VALUES ($1, $2, $3)
        ON CONFLICT (id) DO UPDATE SET position = EXCLUDED.position, data = EXCLUDED.data`,
-      [product.id, position, product]
+      [product.id, position, data]
     );
   }
 }
 
 async function saveOrderRow(client, order) {
+  const data = typeof order === 'string' ? order : JSON.stringify(order);
   await client.query(
     `INSERT INTO orders (reference, customer_phone, status, created_at, data)
      VALUES ($1, $2, $3, $4, $5)
@@ -49,7 +63,7 @@ async function saveOrderRow(client, order) {
            status = EXCLUDED.status,
            created_at = EXCLUDED.created_at,
            data = EXCLUDED.data`,
-    [order.ref, order.customer.phone, order.status, order.createdAt, order]
+    [order.ref, order.customer.phone, order.status, order.createdAt, data]
   );
 }
 
@@ -126,22 +140,29 @@ async function initialize(seed) {
   `);
 
   await transaction(async (client) => {
-    await client.query('SELECT pg_advisory_xact_lock($1)', [746851204091]);
+    try {
+      await client.query('SELECT pg_advisory_xact_lock($1)', [746851204091]);
+    } catch {
+      // Advisory locks may not be supported in some connection poolers (e.g. PgBouncer)
+    }
     const migration = await client.query(
       'SELECT 1 FROM app_migrations WHERE name = $1',
       ['legacy_json_import_v1']
     );
+    const productCount = await client.query('SELECT count(*)::integer AS count FROM products');
+    if (productCount.rows[0].count === 0 && Array.isArray(seed.products) && seed.products.length > 0) {
+      await saveProductRows(client, seed.products);
+    }
     if (migration.rowCount === 0) {
-      const productCount = await client.query('SELECT count(*)::integer AS count FROM products');
-      if (productCount.rows[0].count === 0) await saveProductRows(client, seed.products);
-
       const orderCount = await client.query('SELECT count(*)::integer AS count FROM orders');
-      if (orderCount.rows[0].count === 0) {
+      if (orderCount.rows[0].count === 0 && Array.isArray(seed.orders) && seed.orders.length > 0) {
         for (const order of seed.orders) await saveOrderRow(client, order);
       }
 
       const analyticsCount = await client.query('SELECT count(*)::integer AS count FROM analytics_days');
-      if (analyticsCount.rows[0].count === 0) await seedAnalyticsRows(client, seed.analytics.days);
+      if (analyticsCount.rows[0].count === 0 && seed.analytics && Array.isArray(seed.analytics.days) && seed.analytics.days.length > 0) {
+        await seedAnalyticsRows(client, seed.analytics.days);
+      }
 
       await client.query('INSERT INTO app_migrations (name) VALUES ($1)', ['legacy_json_import_v1']);
     }
@@ -247,7 +268,11 @@ async function saveOrder(order, expectedUpdatedAt) {
 async function updateProducts(update) {
   if (typeof update !== 'function') throw new TypeError('Product updates must be a function.');
   return transaction(async (client) => {
-    await client.query('SELECT pg_advisory_xact_lock($1)', [PRODUCT_WRITE_LOCK]);
+    try {
+      await client.query('SELECT pg_advisory_xact_lock($1)', [PRODUCT_WRITE_LOCK]);
+    } catch {
+      // Advisory locks may not be supported in some connection poolers
+    }
     const result = await client.query('SELECT data FROM products ORDER BY position, id');
     const currentProducts = result.rows.map((row) => row.data);
     const nextProducts = await update(currentProducts);
@@ -263,7 +288,11 @@ async function updateProducts(update) {
 async function updateAnalytics(update) {
   if (typeof update !== 'function') throw new TypeError('Analytics updates must be a function.');
   return transaction(async (client) => {
-    await client.query('SELECT pg_advisory_xact_lock($1)', [ANALYTICS_WRITE_LOCK]);
+    try {
+      await client.query('SELECT pg_advisory_xact_lock($1)', [ANALYTICS_WRITE_LOCK]);
+    } catch {
+      // Advisory locks may not be supported in some connection poolers
+    }
     const currentDays = await loadAnalyticsRows(client);
     const nextDays = await update(currentDays);
     if (!Array.isArray(nextDays)) throw new TypeError('Analytics updates must return an analytics list.');
@@ -279,11 +308,12 @@ async function updateAnalytics(update) {
 }
 
 async function healthCheck() {
+  if (!pool) return;
   await pool.query('SELECT 1');
 }
 
 async function close() {
-  await pool.end();
+  if (pool) await pool.end();
 }
 
 module.exports = {

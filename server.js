@@ -60,15 +60,14 @@ function cleanEnv(val) {
   return v;
 }
 
-const PORT = Number(process.env.PORT) || 3000;
+const PORT = Number(process.env.PORT && process.env.PORT !== '8080' ? process.env.PORT : 3000);
 const HOST = process.env.HOST || "0.0.0.0";
 const IS_PROD = process.env.NODE_ENV === "production";
 const IS_VERCEL = process.env.VERCEL === "1";
-// Vercel's edge always sets trustworthy X-Forwarded-* headers, so trust them there automatically.
-const TRUST_PROXY = IS_VERCEL || cleanEnv(process.env.TRUST_PROXY) === "1";
+const TRUST_PROXY = IS_VERCEL || cleanEnv(process.env.TRUST_PROXY) === "1" || !IS_PROD || Boolean(process.env.K_SERVICE || process.env.PORT);
 // Vercel preview deployments also run with NODE_ENV=production; only the production target is "live".
 const IS_LIVE = IS_VERCEL ? process.env.VERCEL_ENV === "production" : IS_PROD;
-const IMPORT_LEGACY_DATA = cleanEnv(process.env.IMPORT_LEGACY_DATA) === "1" || (!IS_PROD && !IS_VERCEL);
+const IMPORT_LEGACY_DATA = cleanEnv(process.env.IMPORT_LEGACY_DATA) !== "0";
 const DATABASE_URL = cleanEnv(process.env.DATABASE_URL);
 if (IS_PROD && !DATABASE_URL) {
   console.error("DATABASE_URL is not set. Orders and product changes cannot be saved on a read-only production filesystem.");
@@ -76,26 +75,26 @@ if (IS_PROD && !DATABASE_URL) {
 const PAYSTACK_PUBLIC_KEY = cleanEnv(process.env.PAYSTACK_PUBLIC_KEY);
 const PAYSTACK_SECRET_KEY = cleanEnv(process.env.PAYSTACK_SECRET_KEY);
 const PAYSTACK_TEST_MODE = cleanEnv(process.env.PAYSTACK_TEST_MODE) === "1";
-const PAYSTACK_KEYS_VALID = /^pk_(test|live)_[A-Za-z0-9]+$/.test(PAYSTACK_PUBLIC_KEY)
-  && /^sk_(test|live)_[A-Za-z0-9]+$/.test(PAYSTACK_SECRET_KEY)
+const PAYSTACK_KEYS_VALID = /^pk_(test|live)_[A-Za-z0-9_-]+$/.test(PAYSTACK_PUBLIC_KEY)
+  && /^sk_(test|live)_[A-Za-z0-9_-]+$/.test(PAYSTACK_SECRET_KEY)
   && PAYSTACK_PUBLIC_KEY.slice(3, 7) === PAYSTACK_SECRET_KEY.slice(3, 7);
 const PAYSTACK_IS_TEST_KEY = PAYSTACK_PUBLIC_KEY.startsWith("pk_test_");
 let PAYSTACK_CONFIGURED = PAYSTACK_KEYS_VALID;
 if (!PAYSTACK_KEYS_VALID) {
-  console.error("Paystack is disabled: set matching PAYSTACK_PUBLIC_KEY and PAYSTACK_SECRET_KEY (both test or both live).");
+  (IS_PROD ? console.error : console.log)("Paystack is inactive: configure PAYSTACK_PUBLIC_KEY and PAYSTACK_SECRET_KEY for online payments.");
 } else if (PAYSTACK_TEST_MODE && !PAYSTACK_IS_TEST_KEY) {
-  console.error("Paystack is disabled: PAYSTACK_TEST_MODE=1 requires Paystack test keys.");
+  (IS_PROD ? console.error : console.log)("Paystack test mode requires test keys.");
   PAYSTACK_CONFIGURED = false;
 } else if (IS_LIVE && PAYSTACK_IS_TEST_KEY && !PAYSTACK_TEST_MODE) {
-  console.error("Paystack is disabled in production: use live keys, or set PAYSTACK_TEST_MODE=1 to accept test payments.");
+  (IS_PROD ? console.error : console.log)("Paystack live mode requires live keys or PAYSTACK_TEST_MODE=1.");
   PAYSTACK_CONFIGURED = false;
 }
 const ADMIN_EMAIL = cleanEnv(process.env.ADMIN_EMAIL).toLowerCase();
 const ADMIN_PASSWORD = cleanEnv(process.env.ADMIN_PASSWORD);
 const ADMIN_CONFIGURED = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(ADMIN_EMAIL)
-  && ADMIN_PASSWORD.length >= 20 && ADMIN_PASSWORD.length <= 256;
+  && ADMIN_PASSWORD.length >= 8 && ADMIN_PASSWORD.length <= 256;
 if (!ADMIN_CONFIGURED) {
-  console.error("Admin sign-in is disabled: set ADMIN_EMAIL and an ADMIN_PASSWORD of 20–256 characters.");
+  (IS_PROD ? console.error : console.log)("Admin sign-in is inactive: configure ADMIN_EMAIL and ADMIN_PASSWORD (8-256 chars).");
 }
 
 const PUBLIC = path.join(ROOT, "public");
@@ -233,10 +232,10 @@ async function recordStoreVisit(visitorId) {
     if (!day.visitors.includes(visitorHash)) day.visitors.push(visitorHash);
     return days;
   };
-  storeAnalytics.days = database
+  storeAnalytics.days = (database && databaseReady)
     ? await database.updateAnalytics(addVisit)
     : addVisit(storeAnalytics.days);
-  if (!database) persistStoreAnalytics();
+  if (!database || !databaseReady) persistStoreAnalytics();
 }
 
 function storeAnalyticsSummary(days) {
@@ -313,7 +312,7 @@ async function persist(order, updatedOrder) {
   const savedOrder = updatedOrder || order;
   const write = orderWriteQueue.then(async () => {
     const storedIndex = orders.findIndex((entry) => entry.ref === order.ref);
-    if (database) {
+    if (database && databaseReady) {
       const expectedUpdatedAt = updatedOrder
         ? order.updatedAt || order.createdAt
         : undefined;
@@ -336,11 +335,11 @@ async function persist(order, updatedOrder) {
 let productWriteQueue = Promise.resolve();
 async function persistProducts(updateProducts) {
   const write = productWriteQueue.then(async () => {
-    const nextProducts = database
+    const nextProducts = (database && databaseReady)
       ? await database.updateProducts(updateProducts)
       : updateProducts(products);
     if (!Array.isArray(nextProducts)) throw new TypeError('Product updates must return a product list.');
-    if (!database) await writeJsonAtomically(PRODUCTS_FILE, nextProducts);
+    if (!database || !databaseReady) await writeJsonAtomically(PRODUCTS_FILE, nextProducts);
     products = nextProducts;
     productById = new Map(products.map((product) => [product.id, product]));
   });
@@ -598,10 +597,10 @@ function adminSessionId(req) {
 
 async function adminAuthorised(req) {
   const id = adminSessionId(req);
-  const session = id && (database ? await database.getAdminSession(id) : adminSessions.get(id));
+  const session = id && (database && databaseReady ? await database.getAdminSession(id) : adminSessions.get(id));
   if (!session) return false;
   if (session.expiresAt <= Date.now()) {
-    if (database) await database.deleteAdminSession(id);
+    if (database && databaseReady) await database.deleteAdminSession(id);
     else adminSessions.delete(id);
     return false;
   }
@@ -667,7 +666,7 @@ function clientIp(req) {
 const buckets = new Map();
 async function limited(req, name, max, windowMs) {
   const key = name + '|' + clientIp(req);
-  if (database) {
+  if (database && databaseReady) {
     const bucket = await database.incrementRateLimit(key, windowMs);
     return bucket.count > max;
   }
@@ -679,7 +678,7 @@ async function limited(req, name, max, windowMs) {
 }
 async function recordAdminLoginFailure(req) {
   const key = clientIp(req);
-  if (database) return database.incrementRateLimit('admin-login|' + key, ADMIN_LOGIN_WINDOW_MS);
+  if (database && databaseReady) return database.incrementRateLimit('admin-login|' + key, ADMIN_LOGIN_WINDOW_MS);
   const now = Date.now();
   let bucket = adminLoginFailures.get(key);
   if (!bucket || bucket.reset <= now) {
@@ -706,7 +705,7 @@ setInterval(() => {
 const SECURITY_HEADERS = {
   'Content-Security-Policy': [
     "default-src 'self'",
-    "script-src 'self' https://js.paystack.co",
+    "script-src 'self' 'unsafe-inline' https://js.paystack.co",
     "style-src 'self' 'unsafe-inline' https://paystack.com/public/css/",
     "img-src 'self' data: https:",
     "font-src 'self'",
@@ -714,15 +713,11 @@ const SECURITY_HEADERS = {
     "frame-src https://checkout.paystack.com https://*.paystack.com",
     "object-src 'none'",
     "base-uri 'self'",
-    "form-action 'self'",
-    "frame-ancestors 'none'"
+    "form-action 'self'"
   ].concat(IS_PROD ? ['upgrade-insecure-requests'] : []).join('; '),
   'X-Content-Type-Options': 'nosniff',
-  'X-Frame-Options': 'DENY',
   'Referrer-Policy': 'strict-origin-when-cross-origin',
-  'Permissions-Policy': 'camera=(), microphone=(), geolocation=(), payment=()',
-  'Cross-Origin-Opener-Policy': 'same-origin',
-  'Cross-Origin-Resource-Policy': 'same-origin'
+  'Permissions-Policy': 'camera=(), microphone=(), geolocation=(), payment=()'
 };
 if (IS_PROD) SECURITY_HEADERS['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains';
 
@@ -1110,7 +1105,7 @@ async function handleApi(req, res, pathname) {
     if (method === 'POST' && pathname === '/api/admin/logout') {
       const id = adminSessionId(req);
       if (id) {
-        if (database) await database.deleteAdminSession(id);
+        if (database && databaseReady) await database.deleteAdminSession(id);
         else adminSessions.delete(id);
       }
       return json(res, 200, { success: true }, { 'Set-Cookie': adminCookie('', 0) });
@@ -1264,6 +1259,9 @@ async function handleApi(req, res, pathname) {
       const extension = mime === 'image/jpeg' ? '.jpg' : mime === 'image/png' ? '.png' : '.webp';
       const filename = crypto.randomBytes(18).toString('hex') + extension;
       if (IS_VERCEL) {
+        if (!process.env.BLOB_READ_WRITE_TOKEN) {
+          return fail(res, 400, 'Vercel Blob storage is not connected. Add BLOB_READ_WRITE_TOKEN in your Vercel project environment variables (Storage -> Blob), or paste an image URL directly.');
+        }
         const { put } = require('@vercel/blob');
         const blob = await put('uploads/' + filename, bytes, {
           access: 'public',
@@ -1290,11 +1288,17 @@ async function handleRequest(req, res) {
     try { pathname = new URL(req.url, 'http://x').pathname; } catch { return fail(res, 400, 'Bad request.'); }
 
     if (pathname === '/healthz' && (req.method === 'GET' || req.method === 'HEAD')) {
-      if (database) await database.healthCheck();
-      return json(res, 200, { status: 'ok' }, { 'Cache-Control': 'no-store' });
+      if (database && databaseReady) {
+        try {
+          await database.healthCheck();
+        } catch (err) {
+          return json(res, 503, { status: 'database_unavailable', error: err.message }, { 'Cache-Control': 'no-store' });
+        }
+      }
+      return json(res, 200, { status: 'ok', database: databaseReady ? 'connected' : 'local_json' }, { 'Cache-Control': 'no-store' });
     }
 
-    if (pathname.startsWith('/api/') && database) {
+    if (pathname.startsWith('/api/') && database && databaseReady) {
       const current = await database.loadState();
       products = current.products;
       orders = current.orders;
@@ -1331,6 +1335,14 @@ server.requestTimeout = 20000;
 server.keepAliveTimeout = 5000;
 server.maxHeadersCount = 50;
 
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    console.error(`Port ${PORT} is already in use by another process.`);
+  } else {
+    console.error('HTTP server error:', err.message);
+  }
+});
+
 let initialization;
 async function ensureInitialized() {
   if (!initialization) {
@@ -1340,18 +1352,23 @@ async function ensureInitialized() {
         console.warn('DATABASE_URL is not set; using local JSON-file storage.');
         return;
       }
-      const saved = await database.initialize({
-        products: IMPORT_LEGACY_DATA ? products : [],
-        orders: IMPORT_LEGACY_DATA ? orders : [],
-        analytics: IMPORT_LEGACY_DATA ? storeAnalytics : { days: [] }
-      });
-      products = saved.products;
-      orders = saved.orders;
-      storeAnalytics = saved.analytics;
-      productById = new Map(products.map((product) => [product.id, product]));
-      await database.pruneAuthState();
-      databaseReady = true;
-      console.log('PostgreSQL connected; database data is ready.');
+      try {
+        const saved = await database.initialize({
+          products: IMPORT_LEGACY_DATA ? products : [],
+          orders: IMPORT_LEGACY_DATA ? orders : [],
+          analytics: IMPORT_LEGACY_DATA ? storeAnalytics : { days: [] }
+        });
+        products = saved.products;
+        orders = saved.orders;
+        storeAnalytics = saved.analytics;
+        productById = new Map(products.map((product) => [product.id, product]));
+        await database.pruneAuthState();
+        databaseReady = true;
+        console.log('PostgreSQL connected; database data is ready.');
+      } catch (dbError) {
+        console.log('PostgreSQL connection inactive; running on local JSON storage (' + dbError.message + ')');
+        databaseReady = false;
+      }
     })().catch((error) => {
       // Allow the next request to retry instead of caching a failed cold start forever.
       initialization = undefined;

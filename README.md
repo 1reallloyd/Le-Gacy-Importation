@@ -29,18 +29,31 @@ pg_restore --no-owner --no-acl --dbname="YOUR_HOSTED_DATABASE_URL" legacys-backu
 ```
 Set the hosted `DATABASE_URL` and production Paystack live keys as deployment secrets, enable HTTPS, and start with `NODE_ENV=production`. Never put production credentials in source control. Keep the dump private and delete it securely when no longer needed. Production uploads also need persistent storage (a persistent disk or object-storage service); PostgreSQL stores product/order data, not image files.
 
-## Vercel deployment
-This repository includes a Vercel Node function adapter. It keeps `npm start` available for local development and routes storefront pages, dashboard requests, API calls, and `/healthz` through the same server handler. Vercel deployments use PostgreSQL for product/order/analytics data, sessions, and rate limits; admin image uploads are stored as public Vercel Blob objects. Product mutations and analytics updates are serialized in PostgreSQL transactions across function instances. Order updates use optimistic concurrency checks and reject stale writes instead of silently replacing a newer update.
+## Vercel Deployment (Recommended)
+This repository is pre-configured for direct zero-configuration deployment to [Vercel](https://vercel.com).
+It routes storefront pages, dashboard requests, API endpoints, and `/healthz` seamlessly through the Vercel Node function adapter.
 
-### Production setup
-1. Import the GitHub repository into Vercel. Ensure the Vercel **Production Branch** points at the reviewed commit/branch; do not assume importing the repository selects `vercel-preview`. Deploying from an outdated `main` branch would omit the Vercel adapter and recent changes.
-2. Create a **new, dedicated production Neon database** and Vercel Blob store. Keep them separate from any Preview resources. In Vercel's **Production** environment variables, set `DATABASE_URL` to Neon's pooled connection URL, `ADMIN_EMAIL`, a private `ADMIN_PASSWORD` of 20–256 characters, and `TRUST_PROXY=1`. Add the production Blob store so `BLOB_READ_WRITE_TOKEN` is provided to Production.
-3. Add matching Paystack **live** keys only in Vercel's private **Production** environment variables: `PAYSTACK_PUBLIC_KEY=pk_live_...` and `PAYSTACK_SECRET_KEY=sk_live_...`. Do not set `PAYSTACK_TEST_MODE` in Production. Never put key values in Git, Preview settings, or chat. Vercel sets `NODE_ENV` for deployment; production startup rejects missing, mismatched, or test payment keys.
-4. Leave `IMPORT_LEGACY_DATA` unset so the new production database starts empty. Do not use the Render staging database as the production database. After deploying, check `/healthz`, sign into `/dashboard`, add a product, upload an image, and verify the site and database remain healthy after a redeploy. Before announcing the store, complete Paystack live account activation, check delivery/contact details, and make a controlled payment test.
-5. Configure Neon backups and perform a restore test. Review Vercel, Neon, and Blob plan limits and billing. The existing Render staging database is separate and is not used by Vercel.
-
-### Preview and payment testing
-Use Vercel **Preview** deployments for testing before directing customers to Production. Give Preview its own Neon database and Blob store, set matching Paystack **test** keys and `PAYSTACK_TEST_MODE=1` only in the Preview environment, and leave `IMPORT_LEGACY_DATA` unset. Never copy production keys into Preview or use live payments for testing. Vercel Preview can be restricted with deployment protection while it is being tested.
+### Step-by-Step Vercel Setup:
+1. **Import the GitHub Repository into Vercel**:
+   - Go to [vercel.com/new](https://vercel.com/new), select your GitHub account, and choose `1reallloyd/Le-Gacy-Importation`.
+   - Keep the Framework Preset as **Other** (Root directory `./`).
+2. **Configure Environment Variables in Vercel**:
+   In the **Environment Variables** section before deploying (or under Project Settings > Environment Variables):
+   - `DATABASE_URL`: Your PostgreSQL connection string (from Neon, Supabase, Vercel Postgres, etc., with `?sslmode=require`).
+     *Note: Tables are automatically created and your initial product catalog from `data/products.json` is automatically seeded on first launch!*
+   - `ADMIN_EMAIL`: Your administrator email (e.g. `admin@legacys.com`).
+   - `ADMIN_PASSWORD`: A private administrator password (at least 8 characters).
+   - `PAYSTACK_PUBLIC_KEY`: Your live Paystack public key (`pk_live_...`).
+   - `PAYSTACK_SECRET_KEY`: Your live Paystack secret key (`sk_live_...`).
+   - `PAYSTACK_TEST_MODE`: `0` (for live payments) or `1` (if using test keys `pk_test_` during preview).
+   - `TRUST_PROXY`: `1`
+   - `IMPORT_LEGACY_DATA`: `1` (ensures your product catalog is seeded into your fresh database).
+   - `BLOB_READ_WRITE_TOKEN`: *(Optional)* If using Vercel Blob for image uploads, add Vercel Blob from the **Storage** tab in your Vercel project dashboard.
+3. **Deploy & Preview**:
+   - Click **Deploy**. Vercel will build and launch your application.
+   - You can test and preview the store on your generated `*.vercel.app` domain immediately before linking your custom domain.
+   - Access `/dashboard` to manage products, view orders, and track store performance.
+   - Check `/healthz` to verify database health and readiness.
 
 ## Admin account storage
 This store currently supports one administrator. Set `ADMIN_EMAIL` and `ADMIN_PASSWORD` as private environment secrets; admin credentials are intentionally not stored in PostgreSQL. The server verifies the configured password with scrypt. Admin session cookies are HTTP-only and same-site; session IDs and rate limits are stored in PostgreSQL when configured and otherwise remain local to the development process. Do not add `ADMIN_PASSWORD` to a database dump or commit it to Git.
