@@ -42,10 +42,18 @@ module.exports = async function vercelHandler(req, res) {
 
     await serverModule.handler(req, res);
 
-    if (!res.writableEnded) {
+    if (!res.writableEnded && !res.finished) {
       await new Promise((resolve) => {
-        res.on('finish', resolve);
-        res.on('close', resolve);
+        let done = false;
+        const finish = () => {
+          if (!done) {
+            done = true;
+            resolve();
+          }
+        };
+        res.once('finish', finish);
+        res.once('close', finish);
+        setTimeout(finish, 2000);
       });
     }
   } catch (error) {

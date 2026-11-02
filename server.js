@@ -789,29 +789,40 @@ async function serveStatic(req, res, pathname) {
   let rel;
   try { rel = decodeURIComponent(pathname); } catch { return fail(res, 400, 'Bad request.'); }
   if (rel.includes('\0')) return fail(res, 400, 'Bad request.');
-  if (rel === '/') rel = '/index.html';
+  if (rel === '/' || !rel) rel = '/index.html';
   const isUpload = rel.startsWith('/uploads/');
   const root = isUpload ? UPLOADS_DIR : PUBLIC;
   const relativePath = isUpload ? rel.slice('/uploads/'.length) : rel.replace(/^[\/\\]/, '');
   const file = path.resolve(root, relativePath);
   if (file !== root && !file.startsWith(root + path.sep)) return fail(res, 403, 'Forbidden.');
 
-  let st;
+  let content;
+  let targetFile = file;
+  let targetRel = rel;
   try {
-    st = await fs.promises.stat(file);
+    const st = await fs.promises.stat(targetFile);
     if (!st.isFile()) throw new Error('Not a file');
+    content = await fs.promises.readFile(targetFile);
   } catch {
-    if (path.extname(rel)) return send(res, 404, 'Not found', { 'Content-Type': 'text/plain; charset=utf-8' });
-    return await serveStatic(req, res, '/index.html');
+    if (targetRel === '/index.html' || path.extname(targetRel)) {
+      return send(res, 404, 'Not found', { 'Content-Type': 'text/plain; charset=utf-8' });
+    }
+    targetFile = path.resolve(PUBLIC, 'index.html');
+    targetRel = '/index.html';
+    try {
+      content = await fs.promises.readFile(targetFile);
+    } catch {
+      return send(res, 404, 'Not found', { 'Content-Type': 'text/plain; charset=utf-8' });
+    }
   }
 
-  const ext = path.extname(file).toLowerCase();
+  const ext = path.extname(targetRel).toLowerCase();
   const headers = {
     'Content-Type': MIME[ext] || 'application/octet-stream',
-    'Content-Length': st.size,
+    'Content-Length': content.length,
     'Cache-Control': ext === '.html' ? 'no-cache' : 'public, max-age=3600'
   };
-  if (path.basename(file) === 'admin.html') {
+  if (path.basename(targetFile) === 'admin.html') {
     headers['X-Robots-Tag'] = 'noindex, nofollow';
     headers['Cache-Control'] = 'no-store';
   }
@@ -820,17 +831,7 @@ async function serveStatic(req, res, pathname) {
     res.end();
     return;
   }
-
-  return new Promise((resolve, reject) => {
-    const stream = fs.createReadStream(file);
-    stream.on('error', (err) => {
-      if (!res.headersSent) fail(res, 500, 'Failed to read file.');
-      reject(err);
-    });
-    res.on('finish', resolve);
-    res.on('close', resolve);
-    stream.pipe(res);
-  });
+  res.end(content);
 }
 
 /* ------------------------------------------------------------------ */
