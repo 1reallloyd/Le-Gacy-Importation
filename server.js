@@ -20,16 +20,30 @@ const crypto = require('crypto');
 const { parse: parseCsv } = require('csv-parse/sync');
 const { readSheet } = require('read-excel-file/node');
 
-const ROOT = fs.existsSync(path.join(process.cwd(), 'data')) ? process.cwd() : __dirname;
-const ENV_FILE = path.join(ROOT, '.env');
+function findProjectRoot() {
+  const candidates = [
+    process.cwd(),
+    __dirname,
+    path.join(__dirname, ".."),
+    path.resolve(".")
+  ];
+  for (const dir of candidates) {
+    if (fs.existsSync(path.join(dir, "data", "store.json"))) {
+      return dir;
+    }
+  }
+  return __dirname;
+}
+const ROOT = findProjectRoot();
+const ENV_FILE = path.join(ROOT, ".env");
 
 if (fs.existsSync(ENV_FILE)) {
-  const contents = fs.readFileSync(ENV_FILE, 'utf8');
+  const contents = fs.readFileSync(ENV_FILE, "utf8");
   for (const [index, rawLine] of contents.split(/\r?\n/).entries()) {
     const line = rawLine.trim();
-    if (!line || line.startsWith('#')) continue;
+    if (!line || line.startsWith("#")) continue;
     const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
-    if (!match) throw new Error('Invalid .env entry on line ' + (index + 1) + '.');
+    if (!match) throw new Error("Invalid .env entry on line " + (index + 1) + ".");
     let value = match[2].trim();
     if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
       value = value.slice(1, -1);
@@ -38,52 +52,75 @@ if (fs.existsSync(ENV_FILE)) {
   }
 }
 
-const PORT = Number(process.env.PORT) || 3000;
-const HOST = process.env.HOST || '0.0.0.0';
-const TRUST_PROXY = process.env.TRUST_PROXY === '1'; // set when behind Nginx/Vercel/Render etc.
-const IS_PROD = process.env.NODE_ENV === 'production';
-const IS_VERCEL = process.env.VERCEL === '1';
-const IMPORT_LEGACY_DATA = process.env.IMPORT_LEGACY_DATA === '1' || (!IS_PROD && !IS_VERCEL);
-const DATABASE_URL = String(process.env.DATABASE_URL || '').trim();
-if (IS_PROD && !DATABASE_URL) {
-  throw new Error('Set DATABASE_URL to a PostgreSQL connection string before starting in production.');
+function cleanEnv(val) {
+  let v = String(val || "").trim();
+  if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
+    v = v.slice(1, -1).trim();
+  }
+  return v;
 }
-const PAYSTACK_PUBLIC_KEY = process.env.PAYSTACK_PUBLIC_KEY || '';
-const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY || '';
-const PAYSTACK_TEST_MODE = process.env.PAYSTACK_TEST_MODE === '1';
+
+const PORT = Number(process.env.PORT) || 3000;
+const HOST = process.env.HOST || "0.0.0.0";
+const TRUST_PROXY = cleanEnv(process.env.TRUST_PROXY) === "1"; // set when behind Nginx/Vercel/Render etc.
+const IS_PROD = process.env.NODE_ENV === "production";
+const IS_VERCEL = process.env.VERCEL === "1";
+const IMPORT_LEGACY_DATA = cleanEnv(process.env.IMPORT_LEGACY_DATA) === "1" || (!IS_PROD && !IS_VERCEL);
+const DATABASE_URL = cleanEnv(process.env.DATABASE_URL);
+if (IS_PROD && !DATABASE_URL) {
+  throw new Error("Set DATABASE_URL to a PostgreSQL connection string before starting in production.");
+}
+const PAYSTACK_PUBLIC_KEY = cleanEnv(process.env.PAYSTACK_PUBLIC_KEY);
+const PAYSTACK_SECRET_KEY = cleanEnv(process.env.PAYSTACK_SECRET_KEY);
+const PAYSTACK_TEST_MODE = cleanEnv(process.env.PAYSTACK_TEST_MODE) === "1";
 const PAYSTACK_CONFIGURED = /^pk_(test|live)_[A-Za-z0-9]+$/.test(PAYSTACK_PUBLIC_KEY)
   && /^sk_(test|live)_[A-Za-z0-9]+$/.test(PAYSTACK_SECRET_KEY)
   && PAYSTACK_PUBLIC_KEY.slice(3, 7) === PAYSTACK_SECRET_KEY.slice(3, 7);
-if (PAYSTACK_TEST_MODE && (!PAYSTACK_CONFIGURED || !PAYSTACK_PUBLIC_KEY.startsWith('pk_test_'))) {
-  throw new Error('PAYSTACK_TEST_MODE=1 requires matching Paystack test keys.');
+if (PAYSTACK_TEST_MODE && (!PAYSTACK_CONFIGURED || !PAYSTACK_PUBLIC_KEY.startsWith("pk_test_"))) {
+  throw new Error("PAYSTACK_TEST_MODE=1 requires matching Paystack test keys.");
 }
-if (IS_PROD && (!PAYSTACK_CONFIGURED || (!PAYSTACK_PUBLIC_KEY.startsWith('pk_live_') && !PAYSTACK_TEST_MODE))) {
-  throw new Error('Production requires matching Paystack live public and secret keys.');
+if (IS_PROD && (!PAYSTACK_CONFIGURED || (!PAYSTACK_PUBLIC_KEY.startsWith("pk_live_") && !PAYSTACK_TEST_MODE))) {
+  throw new Error("Production requires matching Paystack live public and secret keys.");
 }
-const ADMIN_EMAIL = String(process.env.ADMIN_EMAIL || '').trim().toLowerCase();
-const ADMIN_PASSWORD = String(process.env.ADMIN_PASSWORD || '');
+const ADMIN_EMAIL = cleanEnv(process.env.ADMIN_EMAIL).toLowerCase();
+const ADMIN_PASSWORD = cleanEnv(process.env.ADMIN_PASSWORD);
 if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(ADMIN_EMAIL) || ADMIN_PASSWORD.length < 20 || ADMIN_PASSWORD.length > 256) {
-  throw new Error('Set ADMIN_EMAIL and an ADMIN_PASSWORD of 20–256 characters in .env before starting the server.');
+  throw new Error("Set ADMIN_EMAIL and an ADMIN_PASSWORD of 20–256 characters in .env before starting the server.");
 }
 
-const PUBLIC = path.join(ROOT, 'public');
-const DATA = path.join(ROOT, 'data');
-const UPLOADS_DIR = path.resolve(process.env.UPLOADS_DIR || path.join(PUBLIC, 'uploads'));
-const ORDERS_FILE = path.join(DATA, 'orders.json');
-const PRODUCTS_FILE = path.join(DATA, 'products.json');
-const ANALYTICS_FILE = path.join(DATA, 'analytics.json');
+const PUBLIC = path.join(ROOT, "public");
+const DATA = path.join(ROOT, "data");
+const UPLOADS_DIR = path.resolve(process.env.UPLOADS_DIR || path.join(PUBLIC, "uploads"));
+const ORDERS_FILE = path.join(DATA, "orders.json");
+const PRODUCTS_FILE = path.join(DATA, "products.json");
+const ANALYTICS_FILE = path.join(DATA, "analytics.json");
 const ANALYTICS_RETENTION_DAYS = 90;
 const PRODUCT_IMPORT_MAX_BYTES = 5 * 1024 * 1024;
 const PRODUCT_IMPORT_MAX_ROWS = 500;
 const PRODUCT_IMPORT_COLUMNS = new Set([
-  'id', 'name', 'category', 'price', 'instock', 'preorder', 'stock', 'qty',
-  'description', 'sizes', 'colors', 'image'
+  "id", "name", "category", "price", "instock", "preorder", "stock", "qty",
+  "description", "sizes", "colors", "image"
 ]);
 
-const store = JSON.parse(fs.readFileSync(path.join(DATA, 'store.json'), 'utf8'));
-let products = JSON.parse(fs.readFileSync(PRODUCTS_FILE, 'utf8'));
+let store = { name: "Le-Gacy's Importation", currency: "GHS" };
+try {
+  if (fs.existsSync(path.join(DATA, "store.json"))) {
+    store = JSON.parse(fs.readFileSync(path.join(DATA, "store.json"), "utf8"));
+  }
+} catch (e) {
+  console.warn("Could not load store.json:", e.message);
+}
+
+let products = [];
+try {
+  if (fs.existsSync(PRODUCTS_FILE)) {
+    products = JSON.parse(fs.readFileSync(PRODUCTS_FILE, "utf8"));
+  }
+} catch (e) {
+  console.warn("Could not load products.json:", e.message);
+}
 let productById = new Map(products.map((p) => [p.id, p]));
-const database = DATABASE_URL ? require('./database') : null;
+const database = DATABASE_URL ? require("./database") : null;
 let databaseReady = false;
 
 async function prepareUploadsDirectory() {
