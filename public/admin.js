@@ -1435,7 +1435,7 @@
     }
 
     async function readSelectedFile(file) {
-      if (file.size > 5 * 1024 * 1024) throw new Error('Choose a spreadsheet smaller than 5 MB.');
+      if (file.size > 3 * 1024 * 1024) throw new Error('Choose a spreadsheet smaller than 3 MB.');
       const bytes = new Uint8Array(await file.arrayBuffer());
       let binary = '';
       for (let offset = 0; offset < bytes.length; offset += 0x8000) {
@@ -1536,7 +1536,7 @@
         h('div', { class: 'admin-import-guidance' },
           h('strong', { text: 'Required columns: name, category, price.' }),
           h('p', { text: 'Use category names or IDs from your store. A supplied ID updates a match or becomes the new product ID; blank IDs are generated. Use qty for the optional stock quantity; stock is accepted as an older-file alias. Blank optional cells preserve existing values. Separate sizes and colors with commas. Add a direct, publicly accessible HTTPS image URL from any image host, or add an image later by editing the product.' })),
-        h('div', { class: 'field admin-import-file-field' }, h('label', { for: 'productImportFile', text: 'Excel or CSV file · maximum 5 MB · 500 products' }),
+        h('div', { class: 'field admin-import-file-field' }, h('label', { for: 'productImportFile', text: 'Excel or CSV file · maximum 3 MB · 500 products' }),
           Object.assign(selectedFile, { id: 'productImportFile' })),
         feedback,
         h('div', { class: 'admin-modal-actions' },

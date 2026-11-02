@@ -62,30 +62,40 @@ function cleanEnv(val) {
 
 const PORT = Number(process.env.PORT) || 3000;
 const HOST = process.env.HOST || "0.0.0.0";
-const TRUST_PROXY = cleanEnv(process.env.TRUST_PROXY) === "1"; // set when behind Nginx/Vercel/Render etc.
 const IS_PROD = process.env.NODE_ENV === "production";
 const IS_VERCEL = process.env.VERCEL === "1";
+// Vercel's edge always sets trustworthy X-Forwarded-* headers, so trust them there automatically.
+const TRUST_PROXY = IS_VERCEL || cleanEnv(process.env.TRUST_PROXY) === "1";
+// Vercel preview deployments also run with NODE_ENV=production; only the production target is "live".
+const IS_LIVE = IS_VERCEL ? process.env.VERCEL_ENV === "production" : IS_PROD;
 const IMPORT_LEGACY_DATA = cleanEnv(process.env.IMPORT_LEGACY_DATA) === "1" || (!IS_PROD && !IS_VERCEL);
 const DATABASE_URL = cleanEnv(process.env.DATABASE_URL);
 if (IS_PROD && !DATABASE_URL) {
-  throw new Error("Set DATABASE_URL to a PostgreSQL connection string before starting in production.");
+  console.error("DATABASE_URL is not set. Orders and product changes cannot be saved on a read-only production filesystem.");
 }
 const PAYSTACK_PUBLIC_KEY = cleanEnv(process.env.PAYSTACK_PUBLIC_KEY);
 const PAYSTACK_SECRET_KEY = cleanEnv(process.env.PAYSTACK_SECRET_KEY);
 const PAYSTACK_TEST_MODE = cleanEnv(process.env.PAYSTACK_TEST_MODE) === "1";
-const PAYSTACK_CONFIGURED = /^pk_(test|live)_[A-Za-z0-9]+$/.test(PAYSTACK_PUBLIC_KEY)
+const PAYSTACK_KEYS_VALID = /^pk_(test|live)_[A-Za-z0-9]+$/.test(PAYSTACK_PUBLIC_KEY)
   && /^sk_(test|live)_[A-Za-z0-9]+$/.test(PAYSTACK_SECRET_KEY)
   && PAYSTACK_PUBLIC_KEY.slice(3, 7) === PAYSTACK_SECRET_KEY.slice(3, 7);
-if (PAYSTACK_TEST_MODE && (!PAYSTACK_CONFIGURED || !PAYSTACK_PUBLIC_KEY.startsWith("pk_test_"))) {
-  throw new Error("PAYSTACK_TEST_MODE=1 requires matching Paystack test keys.");
-}
-if (IS_PROD && (!PAYSTACK_CONFIGURED || (!PAYSTACK_PUBLIC_KEY.startsWith("pk_live_") && !PAYSTACK_TEST_MODE))) {
-  throw new Error("Production requires matching Paystack live public and secret keys.");
+const PAYSTACK_IS_TEST_KEY = PAYSTACK_PUBLIC_KEY.startsWith("pk_test_");
+let PAYSTACK_CONFIGURED = PAYSTACK_KEYS_VALID;
+if (!PAYSTACK_KEYS_VALID) {
+  console.error("Paystack is disabled: set matching PAYSTACK_PUBLIC_KEY and PAYSTACK_SECRET_KEY (both test or both live).");
+} else if (PAYSTACK_TEST_MODE && !PAYSTACK_IS_TEST_KEY) {
+  console.error("Paystack is disabled: PAYSTACK_TEST_MODE=1 requires Paystack test keys.");
+  PAYSTACK_CONFIGURED = false;
+} else if (IS_LIVE && PAYSTACK_IS_TEST_KEY && !PAYSTACK_TEST_MODE) {
+  console.error("Paystack is disabled in production: use live keys, or set PAYSTACK_TEST_MODE=1 to accept test payments.");
+  PAYSTACK_CONFIGURED = false;
 }
 const ADMIN_EMAIL = cleanEnv(process.env.ADMIN_EMAIL).toLowerCase();
 const ADMIN_PASSWORD = cleanEnv(process.env.ADMIN_PASSWORD);
-if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(ADMIN_EMAIL) || ADMIN_PASSWORD.length < 20 || ADMIN_PASSWORD.length > 256) {
-  throw new Error("Set ADMIN_EMAIL and an ADMIN_PASSWORD of 20–256 characters in .env before starting the server.");
+const ADMIN_CONFIGURED = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(ADMIN_EMAIL)
+  && ADMIN_PASSWORD.length >= 20 && ADMIN_PASSWORD.length <= 256;
+if (!ADMIN_CONFIGURED) {
+  console.error("Admin sign-in is disabled: set ADMIN_EMAIL and an ADMIN_PASSWORD of 20–256 characters.");
 }
 
 const PUBLIC = path.join(ROOT, "public");
@@ -95,7 +105,9 @@ const ORDERS_FILE = path.join(DATA, "orders.json");
 const PRODUCTS_FILE = path.join(DATA, "products.json");
 const ANALYTICS_FILE = path.join(DATA, "analytics.json");
 const ANALYTICS_RETENTION_DAYS = 90;
-const PRODUCT_IMPORT_MAX_BYTES = 5 * 1024 * 1024;
+// Kept below Vercel's 4.5 MB request-body limit once base64-encoded inside JSON.
+const PRODUCT_IMPORT_MAX_BYTES = 3 * 1024 * 1024;
+const PRODUCT_IMPORT_REQUEST_LIMIT = Math.ceil(PRODUCT_IMPORT_MAX_BYTES / 3) * 4 + 64 * 1024;
 const PRODUCT_IMPORT_MAX_ROWS = 500;
 const PRODUCT_IMPORT_COLUMNS = new Set([
   "id", "name", "category", "price", "instock", "preorder", "stock", "qty",
@@ -148,7 +160,9 @@ async function prepareUploadsDirectory() {
 }
 
 const ADMIN_PASSWORD_SALT = crypto.randomBytes(16);
-const ADMIN_PASSWORD_HASH = crypto.scryptSync(ADMIN_PASSWORD, ADMIN_PASSWORD_SALT, 64);
+const ADMIN_PASSWORD_HASH = ADMIN_CONFIGURED
+  ? crypto.scryptSync(ADMIN_PASSWORD, ADMIN_PASSWORD_SALT, 64)
+  : crypto.randomBytes(64);
 const ADMIN_SESSION_TTL = 8 * 60 * 60 * 1000;
 const adminSessions = new Map();
 const ADMIN_LOGIN_FAILURE_LIMIT = 4;
@@ -383,12 +397,12 @@ async function parseProductImport(body) {
     || !['.xlsx', '.csv'].includes(extension)
     || !encoded || encoded.length > maxEncodedLength
     || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) {
-    throw Object.assign(new Error('Choose a valid .xlsx or .csv product file smaller than 5 MB.'), { status: 400 });
+    throw Object.assign(new Error('Choose a valid .xlsx or .csv product file smaller than 3 MB.'), { status: 400 });
   }
 
   const workbook = Buffer.from(encoded, 'base64');
   if (!workbook.length || workbook.length > PRODUCT_IMPORT_MAX_BYTES) {
-    throw Object.assign(new Error('The product file must be smaller than 5 MB.'), { status: 400 });
+    throw Object.assign(new Error('The product file must be smaller than 3 MB.'), { status: 400 });
   }
 
   let rowEntries;
@@ -1062,6 +1076,7 @@ async function handleApi(req, res, pathname) {
     if (await limited(req, 'admin', 300, 15 * 60 * 1000)) return fail(res, 429, 'Too many requests.');
     if (method === 'POST' && !sameOrigin(req)) return fail(res, 403, 'Request rejected.');
     if (method === 'POST' && pathname === '/api/admin/login') {
+      if (!ADMIN_CONFIGURED) return fail(res, 503, 'Admin sign-in is not configured on this server.');
       const b = await readJson(req);
       const email = typeof b.email === 'string' ? b.email.trim().toLowerCase().slice(0, 254) : '';
       const password = typeof b.password === 'string' && b.password.length <= 256 ? b.password : '';
@@ -1130,7 +1145,7 @@ async function handleApi(req, res, pathname) {
     }
     if (method === 'POST' && pathname === '/api/admin/products/import/preview') {
       try {
-        const body = await readJson(req, 7 * 1024 * 1024);
+        const body = await readJson(req, PRODUCT_IMPORT_REQUEST_LIMIT);
         const result = await parseProductImport(body);
         return json(res, 200, result.valid
           ? { valid: true, added: result.added, updated: result.updated, products: result.summaries }
@@ -1145,7 +1160,7 @@ async function handleApi(req, res, pathname) {
     }
     if (method === 'POST' && pathname === '/api/admin/products/import') {
       try {
-        const body = await readJson(req, 7 * 1024 * 1024);
+        const body = await readJson(req, PRODUCT_IMPORT_REQUEST_LIMIT);
         const result = await parseProductImport(body);
         if (!result.valid) return json(res, 400, { error: 'Fix the spreadsheet errors before importing.', rows: result.errors });
         const updates = new Map(result.imported.map(({ product }) => [product.id, product]));
@@ -1337,7 +1352,11 @@ async function ensureInitialized() {
       await database.pruneAuthState();
       databaseReady = true;
       console.log('PostgreSQL connected; database data is ready.');
-    })();
+    })().catch((error) => {
+      // Allow the next request to retry instead of caching a failed cold start forever.
+      initialization = undefined;
+      throw error;
+    });
   }
   return initialization;
 }

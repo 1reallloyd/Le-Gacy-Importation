@@ -10,28 +10,34 @@ try {
   console.error('Fatal: Failed to load server.js:', err);
 }
 
+function sendError(res, error) {
+  if (res.headersSent) {
+    res.end();
+    return;
+  }
+  res.statusCode = 500;
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-store');
+  res.end(JSON.stringify({ error }));
+}
+
 module.exports = async function vercelHandler(req, res) {
   try {
     if (serverLoadError || !serverModule || !serverModule.handler) {
-      const err = serverLoadError || new Error('server.js handler not found');
-      console.error('Module initialization failure:', err);
-      if (!res.headersSent) {
-        res.statusCode = 500;
-        res.setHeader('Content-Type', 'application/json');
-        res.end(JSON.stringify({
-          error: 'Module Initialization Error',
-          message: err.message,
-          stack: err.stack
-        }, null, 2));
-      }
+      console.error('Module initialization failure:', serverLoadError || new Error('server.js handler not found'));
+      sendError(res, 'The store is temporarily unavailable. Please try again shortly.');
       return;
     }
 
+    // vercel.json rewrites every request to /api/index?__route=/<original path>.
+    // Restore the original URL (and drop the helper params Vercel adds) before routing.
     const url = new URL(req.url, 'http://vercel.local');
     const originalPath = url.searchParams.get('__route');
     if (originalPath) {
       url.searchParams.delete('__route');
-      req.url = originalPath + (url.search ? '?' + url.searchParams.toString() : '');
+      url.searchParams.delete('path');
+      const query = url.searchParams.toString();
+      req.url = originalPath + (query ? '?' + query : '');
     }
 
     await serverModule.handler(req, res);
@@ -44,14 +50,6 @@ module.exports = async function vercelHandler(req, res) {
     }
   } catch (error) {
     console.error('Vercel handler runtime error:', error);
-    if (!res.headersSent) {
-      res.statusCode = 500;
-      res.setHeader('Content-Type', 'application/json');
-      res.end(JSON.stringify({
-        error: 'Internal Server Error',
-        message: error && error.message,
-        stack: error && error.stack
-      }, null, 2));
-    }
+    sendError(res, 'Something went wrong. Please try again.');
   }
 };
