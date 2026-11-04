@@ -1,0 +1,27 @@
+/* Mobile-only layout for the revenue chart in Sales reports. The horizontal
+   scroll stays inside the chart card, leaving other dashboard pages unchanged. */
+@media (max-width: 780px) {
+  #adminContent > div:has(.admin-bars) .admin-grid-2 > .admin-card:has(.admin-bars) {
+    min-width: 0;
+    overflow: hidden;
+  }
+
+  #adminContent > div:has(.admin-bars) .admin-bars {
+    box-sizing: border-box;
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    gap: 6px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    overscroll-behavior-x: contain;
+    scrollbar-color: #d7d0e7 transparent;
+    scrollbar-width: thin;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  #adminContent > div:has(.admin-bars) .admin-bar-col {
+    min-width: 0;
+    flex: 0 0 26px;
+  }
+}
