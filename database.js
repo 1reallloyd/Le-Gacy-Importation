@@ -1,5 +1,7 @@
 'use strict';
 
+const fs = require('fs');
+const path = require('path');
 const { Pool } = require('pg');
 
 function getSslConfig() {
@@ -101,6 +103,17 @@ async function seedAnalyticsRows(client, days) {
   }
 }
 
+function loadBundledProducts() {
+  try {
+    const file = path.join(__dirname, 'data', 'products.json');
+    const products = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return Array.isArray(products) ? products : [];
+  } catch (error) {
+    console.warn('Could not load bundled product catalog for database seeding:', error.message);
+    return [];
+  }
+}
+
 async function initialize(seed) {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS app_migrations (
@@ -150,9 +163,18 @@ async function initialize(seed) {
       ['legacy_json_import_v1']
     );
     const productCount = await client.query('SELECT count(*)::integer AS count FROM products');
-    if (productCount.rows[0].count === 0 && Array.isArray(seed.products) && seed.products.length > 0) {
-      await saveProductRows(client, seed.products);
+    // Always populate a brand-new database with the bundled catalog. This is safe
+    // for existing stores because it runs only when the products table is empty.
+    const productSeed = Array.isArray(seed.products) && seed.products.length > 0
+      ? seed.products
+      : loadBundledProducts();
+    if (productCount.rows[0].count === 0 && productSeed.length > 0) {
+      await saveProductRows(client, productSeed);
     }
+    if (migration.rowCount === 0) {
+      await client.query('INSERT INTO app_migrations (name) VALUES ($1)', ['legacy_json_import_v1']);
+    }
+
     if (migration.rowCount === 0) {
       const orderCount = await client.query('SELECT count(*)::integer AS count FROM orders');
       if (orderCount.rows[0].count === 0 && Array.isArray(seed.orders) && seed.orders.length > 0) {
@@ -163,8 +185,6 @@ async function initialize(seed) {
       if (analyticsCount.rows[0].count === 0 && seed.analytics && Array.isArray(seed.analytics.days) && seed.analytics.days.length > 0) {
         await seedAnalyticsRows(client, seed.analytics.days);
       }
-
-      await client.query('INSERT INTO app_migrations (name) VALUES ($1)', ['legacy_json_import_v1']);
     }
   });
 
